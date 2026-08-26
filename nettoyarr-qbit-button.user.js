@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.2.0
-// @description  Ajoute un bouton dans la WebUI qBittorrent pour supprimer un film aussi dans Radarr/Seerr via nettoyarr
+// @version      0.3.0
+// @description  Ajoute un bouton dans la WebUI qBittorrent pour supprimer un film ou une série (y compris pack de saison) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // @match        http://192.168.1.20:8081/*
 // @grant        GM_xmlhttpRequest
 // @connect      192.168.1.20

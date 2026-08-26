@@ -32,11 +32,35 @@ Passe LOG_LEVEL=DEBUG pour voir le payload JSON brut de chaque webhook
 reçu — utile pour vérifier quels champs sont réellement envoyés par ta
 version de Radarr/Sonarr avant d'ajuster la logique de matching.
 
-Suppression déclenchée depuis qBittorrent (optionnel, films uniquement) :
-qBittorrent n'ayant pas de webhook de suppression, on utilise un polling
-en tâche de fond. Activer avec QBIT_POLL_ENABLED=true et fournir
-RADARR_INSTANCES (JSON) :
+Suppression déclenchée depuis qBittorrent (bouton Tampermonkey / delete-by-hash) :
+essaie d'abord un match Radarr (film), puis Sonarr (série) si aucun film ne
+correspond. Fournir RADARR_INSTANCES et/ou SONARR_INSTANCES (JSON) :
   RADARR_INSTANCES=[{"url":"http://192.168.1.20:7878","api_key":"..."}]
+  SONARR_INSTANCES=[{"url":"http://192.168.1.20:8989","api_key":"..."}]
+
+Pour les séries, TOUS les fichiers du torrent sont traités (pas juste le
+premier) — un pack de saison complet supprime chaque episodeFile
+individuellement dans Sonarr. Comportement volontairement prudent :
+- Chaque épisode supprimé est aussi passé "unmonitored" (sinon Sonarr peut
+  le re-rechercher automatiquement, un risque encore plus insidieux que
+  pour Radarr puisqu'il peut se déclencher sans aucune action de ta part).
+- Une SAISON n'est passée "unmonitored" que si elle ne contient plus AUCUN
+  épisode avec fichier après la suppression (typiquement : tu as supprimé
+  le pack complet). Une suppression partielle ne touche jamais la saison.
+- La série elle-même n'est jamais désinscrite ni son monitoring modifié,
+  quel que soit le nombre d'épisodes supprimés — les saisons futures
+  continuent d'être détectées et téléchargées normalement.
+- Seerr n'est jamais nettoyé depuis ce chemin (qBit) pour une série :
+  supprimer des épisodes ne veut pas forcément dire "je ne veux plus
+  cette série". Le nettoyage Seerr reste réservé à une suppression
+  complète déclenchée depuis Sonarr lui-même (webhook item-delete).
+
+Suppression déclenchée depuis qBittorrent, ancienne voie par polling
+(optionnel, films uniquement, désactivée par défaut) :
+qBittorrent n'ayant pas de webhook de suppression, on peut aussi scruter
+périodiquement la liste des torrents pour détecter les disparitions, puis
+demander à Radarr de supprimer le film correspondant (deleteFiles=true).
+Activer avec QBIT_POLL_ENABLED=true (nécessite RADARR_INSTANCES).
 Nécessite que /media soit monté en lecture seule dans ce conteneur pour
 la vérification de sécurité (le script refuse d'agir si le fichier existe
 encore sur le disque, signe que seul le torrent a été retiré sans les
@@ -82,6 +106,8 @@ QBIT_POLL_INTERVAL      = int(os.environ.get("QBIT_POLL_INTERVAL", "60"))
 QBIT_POLL_GRACE_SECONDS = int(os.environ.get("QBIT_POLL_GRACE_SECONDS", "300"))
 # JSON : [{"url": "http://192.168.1.20:7878", "api_key": "..."}, ...]
 RADARR_INSTANCES = json.loads(os.environ.get("RADARR_INSTANCES", "[]"))
+# Même format pour Sonarr (films → séries)
+SONARR_INSTANCES = json.loads(os.environ.get("SONARR_INSTANCES", "[]"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -200,6 +226,136 @@ def find_movie_by_file_size(size):
             if mf and mf.get("size") == size:
                 return instance, m
     return None
+
+
+# ── Client Sonarr (séries) ───────────────────────────────────────────────────
+def sonarr_get_series(instance):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/series")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def sonarr_get_series_detail(instance, series_id):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/series/{series_id}")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def sonarr_get_episodes(instance, series_id):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/episode?seriesId={series_id}")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def sonarr_get_episode_files(instance, series_id):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/episodefile?seriesId={series_id}")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def sonarr_build_file_index():
+    """Construit un index {taille_octets: (instance, series, episode,
+    episodeFile)} pour toutes les instances Sonarr configurées. Un seul
+    passage sur toute la bibliothèque, réutilisé ensuite pour chaque
+    fichier d'un même torrent — indispensable pour les packs de saison
+    (jusqu'à 24 fichiers) sans rescanner Sonarr 24 fois."""
+    index = {}
+    for instance in SONARR_INSTANCES:
+        try:
+            series_list = sonarr_get_series(instance)
+        except Exception as e:
+            log.warning(f"  Impossible d'interroger Sonarr ({instance['url']}) : {e}")
+            continue
+        for s in series_list:
+            try:
+                episodes = sonarr_get_episodes(instance, s["id"])
+                files = sonarr_get_episode_files(instance, s["id"])
+            except Exception as e:
+                log.warning(f"  Impossible de lire les épisodes de « {s.get('title','?')}' » : {e}")
+                continue
+            episodes_by_file_id = {
+                e["episodeFileId"]: e for e in episodes if e.get("episodeFileId")
+            }
+            for ef in files:
+                size = ef.get("size")
+                episode = episodes_by_file_id.get(ef.get("id"))
+                if size and episode:
+                    index[size] = (instance, s, episode, ef)
+    return index
+
+
+def sonarr_delete_episode_file(instance, episode_file_id):
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Suppression Sonarr episodeFile id={episode_file_id} sur {instance['url']}")
+        return
+    url = f"{instance['url'].rstrip('/')}/api/v3/episodefile/{episode_file_id}"
+    req = urllib.request.Request(url, method="DELETE")
+    req.add_header("X-Api-Key", instance["api_key"])
+    urllib.request.urlopen(req, timeout=20)
+    log.info(f"  Suppression demandée à Sonarr : episodeFile id={episode_file_id} sur {instance['url']}")
+
+
+def sonarr_set_episodes_monitored(instance, episode_ids, monitored):
+    if not episode_ids:
+        return
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Sonarr episode(s) {episode_ids} monitored={monitored} sur {instance['url']}")
+        return
+    url = f"{instance['url'].rstrip('/')}/api/v3/episode/monitor"
+    body = json.dumps({"episodeIds": episode_ids, "monitored": monitored}).encode()
+    req = urllib.request.Request(url, data=body, method="PUT")
+    req.add_header("X-Api-Key", instance["api_key"])
+    req.add_header("Content-Type", "application/json")
+    urllib.request.urlopen(req, timeout=20)
+    log.info(f"  Episode(s) {episode_ids} passé(s) monitored={monitored} sur {instance['url']}")
+
+
+def sonarr_maybe_unmonitor_season(instance, series_id, season_number, series_title=""):
+    """Si plus aucun épisode de cette saison n'a de fichier (après la
+    suppression en cours), bascule la SAISON en unmonitored. Ne touche
+    jamais la série elle-même : les autres saisons et les épisodes à
+    venir continuent d'être surveillés normalement."""
+    try:
+        episodes = sonarr_get_episodes(instance, series_id)
+    except Exception as e:
+        log.warning(f"  Impossible de vérifier la saison {season_number} de « {series_title} » : {e}")
+        return
+
+    season_episodes = [e for e in episodes if e.get("seasonNumber") == season_number]
+    if not season_episodes or any(e.get("hasFile") for e in season_episodes):
+        return  # il reste au moins un fichier dans cette saison, on n'y touche pas
+
+    if DRY_RUN:
+        log.info(
+            f"[DRY-RUN] Saison {season_number} de « {series_title} » passée "
+            f"unmonitored (plus aucun fichier) sur {instance['url']}"
+        )
+        return
+
+    try:
+        series = sonarr_get_series_detail(instance, series_id)
+    except Exception as e:
+        log.warning(f"  Impossible de récupérer la série id={series_id} : {e}")
+        return
+
+    changed = False
+    for season in series.get("seasons", []):
+        if season.get("seasonNumber") == season_number and season.get("monitored"):
+            season["monitored"] = False
+            changed = True
+    if not changed:
+        return
+
+    url = f"{instance['url'].rstrip('/')}/api/v3/series/{series_id}"
+    req = urllib.request.Request(url, data=json.dumps(series).encode(), method="PUT")
+    req.add_header("X-Api-Key", instance["api_key"])
+    req.add_header("Content-Type", "application/json")
+    urllib.request.urlopen(req, timeout=20)
+    log.info(f"  Saison {season_number} de « {series_title} » passée unmonitored sur {instance['url']}")
 
 
 def file_still_on_disk(path):
@@ -371,6 +527,26 @@ def tvdb_to_tmdb(tvdb_id):
 
 
 # ── Handlers webhook ─────────────────────────────────────────────────────────
+def sonarr_find_instance_and_series_by_tvdb(tvdb_id):
+    """Identifie sans ambiguïté quelle instance Sonarr gère cette série, en
+    comparant le tvdbId (fiable, présent dans les payloads réels) plutôt
+    que de tenter une action sur toutes les instances à l'aveugle — les ID
+    internes Sonarr (série, épisode) sont propres à chaque instance et
+    peuvent coïncider par hasard entre deux instances différentes."""
+    if not tvdb_id:
+        return None
+    for instance in SONARR_INSTANCES:
+        try:
+            series_list = sonarr_get_series(instance)
+        except Exception as e:
+            log.warning(f"  Impossible d'interroger Sonarr ({instance['url']}) : {e}")
+            continue
+        for s in series_list:
+            if s.get("tvdbId") == tvdb_id:
+                return instance, s
+    return None
+
+
 def handle_file_delete(payload):
     """On Movie File Delete (Radarr) / On Episode File Delete (Sonarr)."""
     movie_file = payload.get("movieFile")
@@ -387,6 +563,36 @@ def handle_file_delete(payload):
 
     log.info(f"Fichier supprimé pour « {title} » : {basename} ({size} octets)")
     find_and_delete_by_file_size(size, label=basename)
+
+    # Épisode Sonarr : même garde-fou que sur le chemin qBit, pour que la
+    # protection anti-regrab s'applique peu importe où la suppression a
+    # été déclenchée (directement dans Sonarr, ou ailleurs).
+    # NON VÉRIFIÉ avec un vrai payload Sonarr à ce stade — noms de champs
+    # devinés par analogie avec l'API REST, à confirmer en LOG_LEVEL=DEBUG
+    # au premier test réel sur un épisode.
+    series = payload.get("series")
+    episodes = payload.get("episodes") or ([payload["episode"]] if payload.get("episode") else [])
+    if series and episodes and SONARR_INSTANCES:
+        found = sonarr_find_instance_and_series_by_tvdb(series.get("tvdbId"))
+        if not found:
+            log.warning(
+                f"  Impossible d'identifier avec certitude quelle instance Sonarr gère "
+                f"« {series.get('title','?')} » (tvdbId={series.get('tvdbId')}) — unmonitor ignoré"
+            )
+        else:
+            instance, real_series = found
+            series_id = real_series["id"]  # ID interne à CETTE instance, pas celui du payload
+            try:
+                for ep in episodes:
+                    ep_id = ep.get("id")
+                    if ep_id is None:
+                        continue
+                    sonarr_set_episodes_monitored(instance, [ep_id], False)
+                season_numbers = {ep.get("seasonNumber") for ep in episodes if ep.get("seasonNumber") is not None}
+                for season_number in season_numbers:
+                    sonarr_maybe_unmonitor_season(instance, series_id, season_number, series.get("title", "?"))
+            except Exception as e:
+                log.error(f"  Erreur lors de l'unmonitor Sonarr : {e}")
 
 
 def handle_item_delete(payload):
@@ -414,11 +620,11 @@ def handle_item_delete(payload):
         )
         log.info(f"Série supprimée de Sonarr : « {title} » (tvdbId={tvdb_id})")
         find_and_delete_by_file_size(folder_size, label=title)
-        tmdb_id = tvdb_to_tmdb(tvdb_id)
+        tmdb_id = series.get("tmdbId") or tvdb_to_tmdb(tvdb_id)
         if tmdb_id:
             seerr_delete_media(tmdb_id, "tv")
         else:
-            log.warning("  Impossible de convertir tvdbId → tmdbId, nettoyage Seerr ignoré")
+            log.warning("  Pas de tmdbId dans le payload et conversion tvdbId → tmdbId impossible, nettoyage Seerr ignoré")
     else:
         log.warning("Payload item-delete sans movie/series, ignoré")
 
@@ -455,7 +661,12 @@ class Handler(BaseHTTPRequestHandler):
         """Appelé par le bouton Tampermonkey dans la WebUI qBittorrent.
         Action immédiate et explicite (clic utilisateur) : pas de délai de
         grâce ni de vérification disque nécessaires, contrairement au
-        polling — l'intention de l'utilisateur est déjà sans ambiguïté."""
+        polling — l'intention de l'utilisateur est déjà sans ambiguïté.
+
+        Essaie d'abord un match Radarr (film, un seul fichier suffit).
+        Si aucun film ne correspond, essaie Sonarr : traite TOUS les
+        fichiers du torrent (pas juste le premier trouvé), pour couvrir
+        un pack de saison complet en un seul clic."""
         qs = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(qs)
         torrent_hash = (params.get("hash") or [""])[0].strip()
@@ -471,8 +682,8 @@ class Handler(BaseHTTPRequestHandler):
         if not torrent_hash:
             respond(400, "Paramètre 'hash' manquant")
             return
-        if not RADARR_INSTANCES:
-            respond(500, "RADARR_INSTANCES n'est pas configuré côté nettoyarr")
+        if not RADARR_INSTANCES and not SONARR_INSTANCES:
+            respond(500, "Ni RADARR_INSTANCES ni SONARR_INSTANCES ne sont configurés côté nettoyarr")
             return
 
         try:
@@ -482,16 +693,49 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sizes = [f.get("size") for f in files if f.get("size")]
-        for size in sizes:
-            found = find_movie_by_file_size(size)
-            if found:
-                instance, movie = found
-                title = movie.get("title", "?")
-                radarr_delete_movie(instance, movie["id"])
-                respond(200, f"« {title} » supprimé de Radarr ({instance['url']}), cascade en cours (qBit/Seerr)")
+
+        # 1) Tentative film (Radarr) — un seul fichier suffit à identifier le film
+        if RADARR_INSTANCES:
+            for size in sizes:
+                found = find_movie_by_file_size(size)
+                if found:
+                    instance, movie = found
+                    title = movie.get("title", "?")
+                    radarr_delete_movie(instance, movie["id"])
+                    respond(200, f"« {title} » supprimé de Radarr ({instance['url']}), cascade en cours (qBit/Seerr)")
+                    return
+
+        # 2) Tentative série (Sonarr) — traite TOUS les fichiers du torrent,
+        #    pas seulement le premier, pour couvrir un pack de saison entier
+        if SONARR_INSTANCES:
+            index = sonarr_build_file_index()
+            matches = [index[s] for s in sizes if s in index]
+
+            if matches:
+                touched_seasons = set()  # (instance_url, series_id, season_number)
+                deleted_titles = []
+
+                for instance, series, episode, ep_file in matches:
+                    sonarr_delete_episode_file(instance, ep_file["id"])
+                    sonarr_set_episodes_monitored(instance, [episode["id"]], False)
+                    touched_seasons.add((instance["url"], series["id"], ep_file.get("seasonNumber"), series.get("title", "?")))
+
+                    season_num = ep_file.get("seasonNumber")
+                    ep_num = episode.get("episodeNumber")
+                    if isinstance(season_num, int) and isinstance(ep_num, int):
+                        deleted_titles.append(f"{series.get('title','?')} S{season_num:02d}E{ep_num:02d}")
+                    else:
+                        deleted_titles.append(series.get("title", "?"))
+
+                instances_by_url = {i["url"]: i for i in SONARR_INSTANCES}
+                for url, series_id, season_number, series_title in touched_seasons:
+                    sonarr_maybe_unmonitor_season(instances_by_url[url], series_id, season_number, series_title)
+
+                summary = ", ".join(deleted_titles[:5]) + (f" (+{len(deleted_titles) - 5} autres)" if len(deleted_titles) > 5 else "")
+                respond(200, f"{len(matches)} épisode(s) supprimé(s) de Sonarr : {summary} — cascade en cours (qBit)")
                 return
 
-        respond(404, "Aucun film Radarr ne correspond à ce torrent")
+        respond(404, "Aucun film ou épisode Radarr/Sonarr ne correspond à ce torrent")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))

@@ -5,6 +5,23 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.3.0] - 2026-08-26
+
+### Added
+- Support complet des séries (Sonarr) sur le bouton qBittorrent : identifie et supprime chaque fichier-épisode correspondant, y compris pour un pack de saison complet en un seul clic (12 épisodes validés en conditions réelles)
+- Chaque épisode supprimé est automatiquement passé en `unmonitored` (Sonarr ne le recherchera plus jamais automatiquement)
+- Une saison entièrement vidée de ses fichiers est automatiquement passée en `unmonitored` — jamais en cas de suppression partielle, jamais la série elle-même
+- Identification fiable de l'instance Sonarr concernée via `tvdbId` (évite toute action accidentelle sur la mauvaise instance quand plusieurs Sonarr sont configurés)
+- `SONARR_INSTANCES` (même format que `RADARR_INSTANCES`) pour le bouton qBittorrent
+
+### Fixed
+- Utilisation directe de `tmdbId` quand il est présent dans le payload Sonarr, au lieu de systématiquement repasser par une conversion TMDB
+
+### Known limitations
+- `seriesFolderSize` (suppression complète d'une série via Sonarr) reste non confirmé par un test réel — à valider avant de s'y fier
+- Le nettoyage Seerr pour une série n'a pas encore été testé en conditions réelles
+- Le bouton qBittorrent ne gère qu'un seul torrent sélectionné à la fois (pas de sélection multiple)
+
 ## [0.2.0] - 2026-08-26
 
 ### Added
