@@ -12,7 +12,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Checkout
@@ -37,3 +37,20 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE_NAME }}:latest
+
+      - name: Extraire la section du CHANGELOG pour ce tag
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {flag=1; next}
+            /^## \[/ && flag {exit}
+            flag {print}
+          ' CHANGELOG.md > release_notes.md
+          echo "--- Notes extraites pour $VERSION ---"
+          cat release_notes.md
+
+      - name: Créer la Release GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md

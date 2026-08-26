@@ -31,11 +31,23 @@ du conteneur.
 Passe LOG_LEVEL=DEBUG pour voir le payload JSON brut de chaque webhook
 reçu — utile pour vérifier quels champs sont réellement envoyés par ta
 version de Radarr/Sonarr avant d'ajuster la logique de matching.
+
+Suppression déclenchée depuis qBittorrent (optionnel, films uniquement) :
+qBittorrent n'ayant pas de webhook de suppression, on utilise un polling
+en tâche de fond. Activer avec QBIT_POLL_ENABLED=true et fournir
+RADARR_INSTANCES (JSON) :
+  RADARR_INSTANCES=[{"url":"http://192.168.1.20:7878","api_key":"..."}]
+Nécessite que /media soit monté en lecture seule dans ce conteneur pour
+la vérification de sécurité (le script refuse d'agir si le fichier existe
+encore sur le disque, signe que seul le torrent a été retiré sans les
+fichiers). Sans ce montage, la vérification est ignorée avec un warning.
 """
 
 import json
 import logging
 import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +68,20 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")  # requis seulement pour les s
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9999"))
 DRY_RUN     = os.environ.get("DRY_RUN", "true").lower() == "true"
 LOG_LEVEL   = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# ── Suppression déclenchée depuis qBittorrent (polling) ─────────────────────
+# Désactivé par défaut. qBittorrent n'a pas de webhook "à la suppression",
+# donc on scrute périodiquement la liste des torrents pour détecter les
+# disparitions, puis on demande à Radarr de supprimer le film correspondant
+# (deleteFiles=true) — ce qui déclenche le webhook item-delete existant et
+# cascade proprement vers Seerr, sans jamais toucher le fichier directement
+# ni risquer un regrab automatique (Radarr est toujours informé).
+# Films uniquement pour l'instant — pas encore de support séries/Sonarr ici.
+QBIT_POLL_ENABLED       = os.environ.get("QBIT_POLL_ENABLED", "false").lower() == "true"
+QBIT_POLL_INTERVAL      = int(os.environ.get("QBIT_POLL_INTERVAL", "60"))
+QBIT_POLL_GRACE_SECONDS = int(os.environ.get("QBIT_POLL_GRACE_SECONDS", "300"))
+# JSON : [{"url": "http://192.168.1.20:7878", "api_key": "..."}, ...]
+RADARR_INSTANCES = json.loads(os.environ.get("RADARR_INSTANCES", "[]"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -139,6 +165,129 @@ class QBClient:
 
 
 qb = QBClient(QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY)
+
+
+# ── Client Radarr (pour le polling qBit uniquement) ─────────────────────────
+def radarr_get_movies(instance):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/movie")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def radarr_delete_movie(instance, movie_id):
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Suppression Radarr movie id={movie_id} sur {instance['url']}")
+        return
+    url = f"{instance['url'].rstrip('/')}/api/v3/movie/{movie_id}?deleteFiles=true"
+    req = urllib.request.Request(url, method="DELETE")
+    req.add_header("X-Api-Key", instance["api_key"])
+    urllib.request.urlopen(req, timeout=20)
+    log.info(f"  Suppression demandée à Radarr : movie id={movie_id} sur {instance['url']}")
+
+
+def find_movie_by_file_size(size):
+    """Cherche, sur toutes les instances Radarr configurées, un film dont
+    le fichier importé a exactement cette taille."""
+    for instance in RADARR_INSTANCES:
+        try:
+            movies = radarr_get_movies(instance)
+        except Exception as e:
+            log.warning(f"  Impossible d'interroger Radarr ({instance['url']}) : {e}")
+            continue
+        for m in movies:
+            mf = m.get("movieFile")
+            if mf and mf.get("size") == size:
+                return instance, m
+    return None
+
+
+def file_still_on_disk(path):
+    """Vérifie si le fichier existe encore. Si le point de montage /media
+    n'est pas accessible depuis ce conteneur, on ne peut pas vérifier —
+    on log un avertissement et on laisse passer plutôt que de bloquer."""
+    try:
+        return os.path.exists(path)
+    except OSError as e:
+        log.warning(f"  Impossible de vérifier l'existence de {path} : {e}")
+        return False
+
+
+def handle_qbit_removal(hash_, sizes):
+    log.info(f"Torrent disparu de qBit depuis {QBIT_POLL_GRACE_SECONDS}s ({hash_[:8]}), recherche du film correspondant…")
+    for size in sizes:
+        found = find_movie_by_file_size(size)
+        if not found:
+            continue
+        instance, movie = found
+        title = movie.get("title", "?")
+        movie_file_path = (movie.get("movieFile") or {}).get("path")
+
+        if movie_file_path and file_still_on_disk(movie_file_path):
+            log.warning(
+                f"  « {title} » : le fichier existe toujours sur le disque "
+                f"({movie_file_path}) — le torrent a peut-être été retiré sans "
+                "supprimer les fichiers dans qBit. Rien touché côté Radarr."
+            )
+            return
+
+        log.info(f"  Correspond à « {title} » sur {instance['url']}")
+        radarr_delete_movie(instance, movie["id"])
+        return
+
+    log.info("  Aucun film Radarr ne correspond à ce torrent (pas géré par un *arr ?)")
+
+
+def qbit_poll_loop():
+    log.info(
+        f"Poll qBit démarré (intervalle={QBIT_POLL_INTERVAL}s, "
+        f"grâce={QBIT_POLL_GRACE_SECONDS}s, {len(RADARR_INSTANCES)} instance(s) Radarr)"
+    )
+    file_size_cache = {}   # hash -> [tailles de fichiers]
+    pending_removal = {}   # hash -> timestamp de première absence détectée
+    prev_hashes = None
+
+    while True:
+        try:
+            torrents = qb.get_torrents()
+            current_hashes = {t["hash"] for t in torrents}
+
+            if prev_hashes is None:
+                log.info(f"Initialisation poll qBit : {len(torrents)} torrent(s) en cache")
+                for t in torrents:
+                    files = qb.get_files(t["hash"])
+                    file_size_cache[t["hash"]] = [f.get("size") for f in files if f.get("size")]
+                prev_hashes = current_hashes
+                time.sleep(QBIT_POLL_INTERVAL)
+                continue
+
+            # Nouveaux torrents → mise en cache de leurs tailles de fichiers
+            for h in current_hashes - prev_hashes:
+                t = next((x for x in torrents if x["hash"] == h), None)
+                if t:
+                    files = qb.get_files(h)
+                    file_size_cache[h] = [f.get("size") for f in files if f.get("size")]
+                pending_removal.pop(h, None)
+
+            now = time.time()
+            for h in prev_hashes - current_hashes:
+                pending_removal.setdefault(h, now)
+
+            for h in list(pending_removal.keys()):
+                if h in current_hashes:
+                    pending_removal.pop(h)  # réapparu entre-temps, on annule
+                    continue
+                if now - pending_removal[h] >= QBIT_POLL_GRACE_SECONDS:
+                    handle_qbit_removal(h, file_size_cache.get(h, []))
+                    pending_removal.pop(h)
+                    file_size_cache.pop(h, None)
+
+            prev_hashes = current_hashes
+
+        except Exception as e:
+            log.error(f"Erreur poll qBit : {e}")
+
+        time.sleep(QBIT_POLL_INTERVAL)
 
 
 def find_and_delete_by_file_size(target_size, label=""):
@@ -296,9 +445,53 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(msg.encode())
+        elif self.path.startswith("/delete-by-hash"):
+            self._handle_delete_by_hash()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_delete_by_hash(self):
+        """Appelé par le bouton Tampermonkey dans la WebUI qBittorrent.
+        Action immédiate et explicite (clic utilisateur) : pas de délai de
+        grâce ni de vérification disque nécessaires, contrairement au
+        polling — l'intention de l'utilisateur est déjà sans ambiguïté."""
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        torrent_hash = (params.get("hash") or [""])[0].strip()
+
+        def respond(code, msg):
+            log.info(f"/delete-by-hash ({torrent_hash[:8]}) : {msg}")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(msg.encode())
+
+        if not torrent_hash:
+            respond(400, "Paramètre 'hash' manquant")
+            return
+        if not RADARR_INSTANCES:
+            respond(500, "RADARR_INSTANCES n'est pas configuré côté nettoyarr")
+            return
+
+        try:
+            files = qb.get_files(torrent_hash)
+        except Exception as e:
+            respond(500, f"Torrent introuvable dans qBittorrent : {e}")
+            return
+
+        sizes = [f.get("size") for f in files if f.get("size")]
+        for size in sizes:
+            found = find_movie_by_file_size(size)
+            if found:
+                instance, movie = found
+                title = movie.get("title", "?")
+                radarr_delete_movie(instance, movie["id"])
+                respond(200, f"« {title} » supprimé de Radarr ({instance['url']}), cascade en cours (qBit/Seerr)")
+                return
+
+        respond(404, "Aucun film Radarr ne correspond à ce torrent")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -328,6 +521,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if QBIT_POLL_ENABLED:
+        if not RADARR_INSTANCES:
+            log.warning("QBIT_POLL_ENABLED=true mais RADARR_INSTANCES est vide, le poll ne trouvera jamais rien")
+        threading.Thread(target=qbit_poll_loop, daemon=True).start()
+    else:
+        log.info("Poll qBit désactivé (QBIT_POLL_ENABLED=false)")
+
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
-    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /file-delete, /item-delete)")
+    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /delete-by-hash, /file-delete, /item-delete)")
     server.serve_forever()
