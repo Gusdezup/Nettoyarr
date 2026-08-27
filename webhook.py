@@ -35,8 +35,8 @@ version de Radarr/Sonarr avant d'ajuster la logique de matching.
 Suppression déclenchée depuis qBittorrent (bouton Tampermonkey / delete-by-hash) :
 essaie d'abord un match Radarr (film), puis Sonarr (série) si aucun film ne
 correspond. Fournir RADARR_INSTANCES et/ou SONARR_INSTANCES (JSON) :
-  RADARR_INSTANCES=[{"url":"http://192.168.1.20:7878","api_key":"..."}]
-  SONARR_INSTANCES=[{"url":"http://192.168.1.20:8989","api_key":"..."}]
+  RADARR_INSTANCES=[{"url":"http://localhost:7878","api_key":"..."}]
+  SONARR_INSTANCES=[{"url":"http://localhost:8989","api_key":"..."}]
 
 Pour les séries, TOUS les fichiers du torrent sont traités (pas juste le
 premier) — un pack de saison complet supprime chaque episodeFile
@@ -115,7 +115,7 @@ def _config_from_env():
     """Valeurs par défaut/de repli, lues depuis les variables d'environnement
     — utilisées seulement tant qu'aucun CONFIG_PATH n'existe encore."""
     return {
-        "QBIT_URL": os.environ.get("QBIT_URL", "http://192.168.1.20:8081"),
+        "QBIT_URL": os.environ.get("QBIT_URL", "http://localhost:8081"),
         "QBIT_USER": os.environ.get("QBIT_USER", ""),
         "QBIT_PASS": os.environ.get("QBIT_PASS", ""),
         "QBIT_API_KEY": os.environ.get("QBIT_API_KEY", ""),
@@ -737,7 +737,7 @@ def render_instance_rows(instances, prefix):
     rows = []
     for inst in instances:
         rows.append(f'''    <div class="instance-row">
-      <input type="text" name="{prefix}_URL[]" placeholder="http://192.168.1.20:7878" value="{esc(inst.get('url',''))}">
+      <input type="text" name="{prefix}_URL[]" placeholder="http://localhost:7878" value="{esc(inst.get('url',''))}">
       <input type="text" name="{prefix}_API_KEY[]" placeholder="clé API" value="{esc(inst.get('api_key',''))}">
       <button type="button" class="remove-btn" onclick="this.parentElement.remove()" title="Retirer cette instance">🗑</button>
     </div>''')
@@ -858,7 +858,7 @@ function addInstance(prefix) {{
   const urlInput = document.createElement('input');
   urlInput.type = 'text';
   urlInput.name = prefix + '_URL[]';
-  urlInput.placeholder = 'http://192.168.1.20:7878';
+  urlInput.placeholder = 'http://localhost:7878';
 
   const keyInput = document.createElement('input');
   keyInput.type = 'text';

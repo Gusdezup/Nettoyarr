@@ -1,20 +1,24 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.5.0
+// @version      0.4.1
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
-// @match        http://192.168.1.20:8081/*
+// ⚠️ À PERSONNALISER : remplace TON_URL_QBITTORRENT (ci-dessous) par
+// l'adresse IP ou le nom d'hôte réel de ton serveur qBittorrent, sur les
+// 2 lignes @match et @connect. Voir aussi NETTOYARR_URL plus bas dans le
+// script, pour l'adresse de ton conteneur Nettoyarr (port 9999).
+// @match        http://TON_URL_QBITTORRENT:8081/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
-// @connect      192.168.1.20
+// @connect      TON_URL_QBITTORRENT
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  // Adresse de nettoyarr, à ajuster si besoin
-  const NETTOYARR_URL = "http://192.168.1.20:9999";
+  // ⚠️ À personnaliser (voir en-tête du script) — adresse de TON conteneur Nettoyarr
+  const NETTOYARR_URL = "http://TON_URL_NETTOYARR:9999";
 
   const MENU_ID = "torrentsTableMenu";
   const ITEM_ID = "nettoyarrMenuItem";

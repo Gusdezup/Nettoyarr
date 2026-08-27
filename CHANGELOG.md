@@ -5,6 +5,12 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.4.1] - 2026-08-27
+
+### Fixed
+- Remplacement des valeurs par défaut personnelles (IP privée `192.168.1.20`) par des placeholders neutres (`localhost`) dans `webhook.py` : valeur de repli de `QBIT_URL`, commentaires d'exemple `RADARR_INSTANCES`/`SONARR_INSTANCES`, et placeholders des champs URL d'instance dans la page `/config` (HTML et JS). Ces valeurs ne servaient que de brouillon temporaire au tout premier démarrage (écrasées dès la première sauvegarde depuis `/config`), mais affichaient une IP étrangère à quiconque d'autre déployait le projet.
+- `nettoyarr-qbit-button.user.js` : remplacement de l'IP d'exemple `192.168.1.20` par des placeholders explicites (`TON_URL_QBITTORRENT` pour `@match`/`@connect`, `TON_URL_NETTOYARR` pour `NETTOYARR_URL`) — contrairement à `webhook.py`, `@match`/`@connect` sont des métadonnées statiques lues par le gestionnaire de userscript (Tampermonkey/Violentmonkey) avant même l'exécution, donc pas configurables depuis `/config` ; chacun doit éditer ces lignes pour pointer vers son propre serveur.
+
 ## [0.4.0] - 2026-08-27
 
 ### Added
