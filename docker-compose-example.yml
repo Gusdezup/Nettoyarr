@@ -1,0 +1,85 @@
+services:
+  nettoyarr:
+    image: python:3-alpine
+    container_name: nettoyarr
+    ports:
+      - 9999:9999
+    restart: unless-stopped
+    working_dir: /app
+    command: python3 /app/webhook.py
+
+    environment:
+      # ── INDISPENSABLE ────────────────────────────────────────────────
+      - DRY_RUN=true
+      # Filet de sécurité : si jamais le volume `data` (config persistée,
+      # voir plus bas) disparaît ou repart vide, le conteneur retombe sur
+      # cette valeur au lieu de repartir en mode suppression active par
+      # défaut. À garder ici même une fois `/config` utilisé au quotidien.
+
+      # ── TOUT LE RESTE EST OPTIONNEL ──────────────────────────────────
+      # Ces variables ne servent QUE de valeurs de départ pour le tout
+      # premier démarrage (quand `data/config.json` n'existe pas encore).
+      # Ensuite, `config.json` fait autorité et ces lignes n'ont plus
+      # aucun effet, même après un `docker-compose down && up -d` — la
+      # config réelle se modifie uniquement depuis l'interface web sur
+      # http://<ton-nas>:9999/config.
+      #
+      # Tu peux donc :
+      #   a) tout supprimer ci-dessous et tout renseigner via /config
+      #      juste après le premier `docker-compose up -d` (recommandé) ;
+      #   b) ou pré-remplir ce qui t'arrange, pour un premier démarrage
+      #      déjà fonctionnel (utile si tu veux versionner une base).
+
+      # - QBIT_URL=http://192.168.1.20:8081
+      # - QBIT_USER=
+      # - QBIT_PASS=
+      # - QBIT_API_KEY=
+      # ↑ Authentification qBittorrent : soit QBIT_API_KEY (qBittorrent >=
+      # 5.2.0, recommandé), soit QBIT_USER + QBIT_PASS en repli.
+
+      # - SEERR_URL=http://192.168.1.20:5055
+      # - SEERR_API_KEY=
+
+      # - TMDB_API_KEY=
+      # ↑ Seulement si tu utilises Sonarr : convertit un tvdbId en tmdbId
+      # pour retrouver l'entrée Seerr correspondante.
+
+      # - LOG_LEVEL=INFO
+
+      # - QBIT_POLL_ENABLED=false
+      # - QBIT_POLL_INTERVAL=60
+      # - QBIT_POLL_GRACE_SECONDS=300
+      # ↑ Films uniquement : scrute qBittorrent pour détecter un torrent
+      # supprimé directement dans qBit (sans passer par Radarr), et
+      # cascade quand même vers Radarr/Seerr. Désactivé par défaut — le
+      # bouton qBittorrent (voir nettoyarr-qbit-button.user.js) couvre déjà
+      # ce cas plus directement, pour les films ET les séries.
+
+      # - RADARR_INSTANCES=[]
+      # ↑ JSON, une entrée par instance Radarr :
+      # [{"url":"http://192.168.1.20:7878","api_key":"..."},{"url":"http://192.168.1.20:7879","api_key":"..."}]
+
+      # - SONARR_INSTANCES=[]
+      # ↑ Même format pour Sonarr :
+      # [{"url":"http://192.168.1.20:8989","api_key":"..."}]
+
+    volumes:
+      # ── INDISPENSABLES ───────────────────────────────────────────────
+      - ./webhook.py:/app/webhook.py:ro
+      # Le code du conteneur, en lecture seule.
+
+      - ./data:/app/data
+      # EN ÉCRITURE. C'est ici que vit config.json (config éditable depuis
+      # /config), persistant entre redémarrages/recréations du conteneur.
+      # Sans ce volume, toute modif faite via /config serait perdue au
+      # prochain redémarrage.
+
+      # ── OPTIONNEL ─────────────────────────────────────────────────────
+      # - /path/to/your/media:/media:ro
+      # Uniquement nécessaire si tu actives QBIT_POLL_ENABLED (vérifie que
+      # le fichier a bien disparu du disque avant de toucher à Radarr).
+
+    deploy:
+      resources:
+        limits:
+          memory: 128M

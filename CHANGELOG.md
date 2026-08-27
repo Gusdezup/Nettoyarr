@@ -5,6 +5,26 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.4.0] - 2026-08-27
+
+### Added
+- Interface de configuration web sur `/config` (GET pour le formulaire, POST pour sauvegarder) : toutes les variables (qBittorrent, Seerr, TMDB, `DRY_RUN`, `LOG_LEVEL`, poll qBit, `RADARR_INSTANCES`/`SONARR_INSTANCES`) sont désormais éditables sans toucher au `docker-compose.yml` ni redémarrer le conteneur
+- Config persistée dans un fichier JSON (`CONFIG_PATH`, défaut `/app/data/config.json`) sur un nouveau volume en écriture ; au premier démarrage, initialisée depuis les variables d'environnement puis sauvegardée — les variables d'env deviennent alors de simples valeurs par défaut pour un premier démarrage, plus la source de vérité
+- Instances Radarr/Sonarr éditables via des champs URL + clé API dédiés (plus de JSON à taper à la main)
+- `docker-compose-example.yml` : version vierge et commentée du compose, à committer dans le repo pour tout nouvel utilisateur, avec distinction claire entre ce qui est indispensable (volume `data`, `DRY_RUN`) et ce qui est optionnel
+- Le bouton flottant est remplacé par une vraie entrée **"🧹 Nettoyarr"** injectée dans le menu contextuel natif de qBittorrent (clic droit sur un torrent), à côté de "Retirer", "Copier", etc.
+- **Support de la sélection multiple** : clic droit sur plusieurs torrents sélectionnés déclenche une suppression pour chacun (`torrentsTable.selectedRowsIds()` renvoie tous les hashes sélectionnés, plus seulement le premier) — lève la limitation notée dans les "Known limitations" de la v0.3.0
+- Popup de confirmation et de résultat custom (HTML, stylée), à la place des `confirm()`/`alert()` natifs du navigateur qui affichaient toujours l'origine de la page en en-tête
+- `/delete-by-hash` répond désormais en JSON structuré (`ok`, `title`/`summary`, `targets`, ...) au lieu d'un texte libre destiné aux logs — le script construit son propre message précis, avec les cibles réellement nettoyées (Seerr **uniquement pour les films**, jamais pour un épisode supprimé par ce chemin — cohérent avec le choix assumé documenté en tête de `webhook.py`)
+- Nom du/des torrent(s) affiché dans la confirmation et le résultat, récupéré directement via l'API qBittorrent (`/api/v2/torrents/info`, même origine que la page, pas besoin de `GM_xmlhttpRequest` pour cet appel)
+
+### Changed
+- `docker-compose.yml` : ajout du volume `data` (écriture) requis par la nouvelle config persistée
+- `nettoyarr-qbit-button.user.js` : accès à `torrentsTable` via `unsafeWindow` (objet de la page qBittorrent, hors du contexte isolé du userscript) au lieu de lire le hash depuis le presse-papier ou une popup
+
+### Removed
+- Le bouton flottant en bas à droite de l'écran, la lecture du presse-papier, et la popup de saisie manuelle du hash — plus nécessaires
+
 ## [0.3.0] - 2026-08-26
 
 ### Added

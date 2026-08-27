@@ -67,6 +67,7 @@ encore sur le disque, signe que seul le torrent a été retiré sans les
 fichiers). Sans ce montage, la vérification est ignorée avec un warning.
 """
 
+import html
 import json
 import logging
 import os
@@ -78,43 +79,139 @@ import urllib.request
 from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ── Config (variables d'environnement) ─────────────────────────────────────
-QBIT_URL      = os.environ.get("QBIT_URL", "http://192.168.1.20:8081")
-QBIT_USER     = os.environ.get("QBIT_USER", "")
-QBIT_PASS     = os.environ.get("QBIT_PASS", "")
-QBIT_API_KEY  = os.environ.get("QBIT_API_KEY", "")  # qBittorrent >= 5.2.0, recommandé
-
-SEERR_URL     = os.environ.get("SEERR_URL", "http://seerr:5055")
-SEERR_API_KEY = os.environ.get("SEERR_API_KEY", "")
-
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")  # requis seulement pour les séries
-
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9999"))
-DRY_RUN     = os.environ.get("DRY_RUN", "true").lower() == "true"
-LOG_LEVEL   = os.environ.get("LOG_LEVEL", "INFO").upper()
-
-# ── Suppression déclenchée depuis qBittorrent (polling) ─────────────────────
-# Désactivé par défaut. qBittorrent n'a pas de webhook "à la suppression",
-# donc on scrute périodiquement la liste des torrents pour détecter les
-# disparitions, puis on demande à Radarr de supprimer le film correspondant
-# (deleteFiles=true) — ce qui déclenche le webhook item-delete existant et
-# cascade proprement vers Seerr, sans jamais toucher le fichier directement
-# ni risquer un regrab automatique (Radarr est toujours informé).
-# Films uniquement pour l'instant — pas encore de support séries/Sonarr ici.
-QBIT_POLL_ENABLED       = os.environ.get("QBIT_POLL_ENABLED", "false").lower() == "true"
-QBIT_POLL_INTERVAL      = int(os.environ.get("QBIT_POLL_INTERVAL", "60"))
-QBIT_POLL_GRACE_SECONDS = int(os.environ.get("QBIT_POLL_GRACE_SECONDS", "300"))
-# JSON : [{"url": "http://192.168.1.20:7878", "api_key": "..."}, ...]
-RADARR_INSTANCES = json.loads(os.environ.get("RADARR_INSTANCES", "[]"))
-# Même format pour Sonarr (films → séries)
-SONARR_INSTANCES = json.loads(os.environ.get("SONARR_INSTANCES", "[]"))
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("arr-cleanup")
-log.info(f"Démarrage — DRY_RUN={DRY_RUN}")
+
+# ── Config dynamique (fichier JSON, éditable via /config sans toucher au
+# docker-compose) ────────────────────────────────────────────────────────────
+# Au premier démarrage, la config est initialisée à partir des variables
+# d'environnement (compatibilité avec les setups existants), puis sauvegardée
+# dans CONFIG_PATH. Tous les démarrages suivants lisent ce fichier — modifier
+# les variables d'environnement dans le compose n'a alors plus d'effet tant
+# que le fichier existe. Toute modification faite depuis /config est
+# appliquée à chaud (pas besoin de redémarrer le conteneur), et persistée
+# sur disque pour survivre à un `docker-compose down && up -d`.
+#
+# CONFIG_PATH doit pointer vers un fichier sur un volume monté en écriture
+# (ex: /app/data/config.json), distinct du montage :ro de webhook.py lui-même.
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/data/config.json")
+CONFIG_LOCK = threading.Lock()
+
+CONFIG_KEYS = [
+    "QBIT_URL", "QBIT_USER", "QBIT_PASS", "QBIT_API_KEY",
+    "SEERR_URL", "SEERR_API_KEY", "TMDB_API_KEY",
+    "DRY_RUN", "LOG_LEVEL",
+    "QBIT_POLL_ENABLED", "QBIT_POLL_INTERVAL", "QBIT_POLL_GRACE_SECONDS",
+    "RADARR_INSTANCES", "SONARR_INSTANCES",
+]
+
+
+def _config_from_env():
+    """Valeurs par défaut/de repli, lues depuis les variables d'environnement
+    — utilisées seulement tant qu'aucun CONFIG_PATH n'existe encore."""
+    return {
+        "QBIT_URL": os.environ.get("QBIT_URL", "http://192.168.1.20:8081"),
+        "QBIT_USER": os.environ.get("QBIT_USER", ""),
+        "QBIT_PASS": os.environ.get("QBIT_PASS", ""),
+        "QBIT_API_KEY": os.environ.get("QBIT_API_KEY", ""),
+        "SEERR_URL": os.environ.get("SEERR_URL", "http://seerr:5055"),
+        "SEERR_API_KEY": os.environ.get("SEERR_API_KEY", ""),
+        "TMDB_API_KEY": os.environ.get("TMDB_API_KEY", ""),
+        "DRY_RUN": os.environ.get("DRY_RUN", "true").lower() == "true",
+        "LOG_LEVEL": os.environ.get("LOG_LEVEL", "INFO").upper(),
+        "QBIT_POLL_ENABLED": os.environ.get("QBIT_POLL_ENABLED", "false").lower() == "true",
+        "QBIT_POLL_INTERVAL": int(os.environ.get("QBIT_POLL_INTERVAL", "60")),
+        "QBIT_POLL_GRACE_SECONDS": int(os.environ.get("QBIT_POLL_GRACE_SECONDS", "300")),
+        "RADARR_INSTANCES": json.loads(os.environ.get("RADARR_INSTANCES", "[]")),
+        "SONARR_INSTANCES": json.loads(os.environ.get("SONARR_INSTANCES", "[]")),
+    }
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp_path = CONFIG_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, CONFIG_PATH)  # écriture atomique
+
+
+def load_config():
+    cfg = _config_from_env()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg.update({k: v for k, v in saved.items() if k in CONFIG_KEYS})
+            log.info(f"Config chargée depuis {CONFIG_PATH}")
+        except Exception as e:
+            log.error(f"Config {CONFIG_PATH} illisible ({e}) — repli sur les variables d'environnement")
+    else:
+        try:
+            save_config(cfg)
+            log.info(
+                f"Première initialisation : config sauvegardée dans {CONFIG_PATH} "
+                "(à partir des variables d'environnement). Elle sera désormais éditable "
+                "depuis /config sans toucher au docker-compose."
+            )
+        except Exception as e:
+            log.warning(
+                f"Impossible d'écrire {CONFIG_PATH} ({e}) — vérifie que ce chemin est sur "
+                "un volume monté en écriture. La config restera basée sur les variables "
+                "d'environnement tant que ce n'est pas corrigé."
+            )
+    return cfg
+
+
+def apply_config(cfg):
+    """Recharge les globals utilisés dans tout le script à partir de cfg.
+    Appelé au démarrage, puis après chaque sauvegarde depuis /config — c'est
+    ce qui permet une prise en compte à chaud, sans redémarrer le conteneur."""
+    global QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY
+    global SEERR_URL, SEERR_API_KEY, TMDB_API_KEY
+    global DRY_RUN, LOG_LEVEL
+    global QBIT_POLL_ENABLED, QBIT_POLL_INTERVAL, QBIT_POLL_GRACE_SECONDS
+    global RADARR_INSTANCES, SONARR_INSTANCES
+    global qb
+
+    QBIT_URL = cfg["QBIT_URL"]
+    QBIT_USER = cfg["QBIT_USER"]
+    QBIT_PASS = cfg["QBIT_PASS"]
+    QBIT_API_KEY = cfg["QBIT_API_KEY"]
+    SEERR_URL = cfg["SEERR_URL"]
+    SEERR_API_KEY = cfg["SEERR_API_KEY"]
+    TMDB_API_KEY = cfg["TMDB_API_KEY"]
+    DRY_RUN = cfg["DRY_RUN"]
+    LOG_LEVEL = cfg["LOG_LEVEL"]
+    QBIT_POLL_ENABLED = cfg["QBIT_POLL_ENABLED"]
+    QBIT_POLL_INTERVAL = cfg["QBIT_POLL_INTERVAL"]
+    QBIT_POLL_GRACE_SECONDS = cfg["QBIT_POLL_GRACE_SECONDS"]
+    RADARR_INSTANCES = cfg["RADARR_INSTANCES"]
+    SONARR_INSTANCES = cfg["SONARR_INSTANCES"]
+
+    logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    qb = QBClient(QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY)
+
+
+def current_config():
+    """Reconstruit un dict cfg à partir des globals actuels — utilisé comme
+    base de fusion lors d'une sauvegarde partielle depuis /config, et pour
+    pré-remplir le formulaire."""
+    return {
+        "QBIT_URL": QBIT_URL, "QBIT_USER": QBIT_USER,
+        "QBIT_PASS": QBIT_PASS, "QBIT_API_KEY": QBIT_API_KEY,
+        "SEERR_URL": SEERR_URL, "SEERR_API_KEY": SEERR_API_KEY,
+        "TMDB_API_KEY": TMDB_API_KEY,
+        "DRY_RUN": DRY_RUN, "LOG_LEVEL": LOG_LEVEL,
+        "QBIT_POLL_ENABLED": QBIT_POLL_ENABLED,
+        "QBIT_POLL_INTERVAL": QBIT_POLL_INTERVAL,
+        "QBIT_POLL_GRACE_SECONDS": QBIT_POLL_GRACE_SECONDS,
+        "RADARR_INSTANCES": RADARR_INSTANCES, "SONARR_INSTANCES": SONARR_INSTANCES,
+    }
 
 
 # ── Client qBittorrent ──────────────────────────────────────────────────────
@@ -190,7 +287,7 @@ class QBClient:
         log.info(f"Torrent(s) supprimé(s) dans qBittorrent : {hashes_param}")
 
 
-qb = QBClient(QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY)
+qb = None  # instancié par apply_config(), au démarrage puis à chaque sauvegarde /config
 
 
 # ── Client Radarr (pour le polling qBit uniquement) ─────────────────────────
@@ -629,6 +726,163 @@ def handle_item_delete(payload):
         log.warning("Payload item-delete sans movie/series, ignoré")
 
 
+def render_instance_rows(instances, prefix):
+    """Une ligne par instance déjà configurée (URL + clé API dans des champs
+    séparés) — plus de JSON à lire ou taper à la main."""
+    def esc(v):
+        return html.escape(str(v))
+
+    if not isinstance(instances, list):
+        instances = []
+    rows = []
+    for inst in instances:
+        rows.append(f'''    <div class="instance-row">
+      <input type="text" name="{prefix}_URL[]" placeholder="http://192.168.1.20:7878" value="{esc(inst.get('url',''))}">
+      <input type="text" name="{prefix}_API_KEY[]" placeholder="clé API" value="{esc(inst.get('api_key',''))}">
+      <button type="button" class="remove-btn" onclick="this.parentElement.remove()" title="Retirer cette instance">🗑</button>
+    </div>''')
+    return "\n".join(rows)
+
+
+def render_config_page(cfg, saved=False, error=""):
+    """Page HTML simple, sans dépendance externe (stdlib uniquement, comme le
+    reste du projet) — formulaire unique qui couvre toute la config, plus
+    besoin d'éditer le docker-compose.yml pour un réglage courant."""
+    def esc(v):
+        return html.escape(str(v))
+
+    checked = lambda b: "checked" if b else ""
+
+    banner = ""
+    if error:
+        banner = f'<div class="banner error">❌ {esc(error)}</div>'
+    elif saved:
+        banner = '<div class="banner ok">✅ Config sauvegardée et appliquée à chaud — aucun redémarrage du conteneur nécessaire.</div>'
+
+    radarr_rows = render_instance_rows(cfg["RADARR_INSTANCES"], "RADARR")
+    sonarr_rows = render_instance_rows(cfg["SONARR_INSTANCES"], "SONARR")
+
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.85em' font-size='90'>🧹</text></svg>">
+<title>Nettoyarr — Config</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#15181c; color:#e8e8e8; max-width:720px; margin:24px auto; padding:0 16px; }}
+  h1 {{ font-size:1.4em; }}
+  h2 {{ font-size:1.05em; color:#c0392b; border-bottom:1px solid #333; padding-bottom:4px; margin-top:28px; }}
+  label {{ display:block; margin-top:12px; font-size:0.9em; color:#aaa; }}
+  input[type=text], input[type=number], textarea {{
+    width:100%; box-sizing:border-box; padding:8px; margin-top:4px;
+    background:#22262b; border:1px solid #3a3f45; border-radius:4px; color:#e8e8e8; font-family:inherit;
+  }}
+  textarea {{ font-family: ui-monospace, monospace; font-size:0.85em; min-height:90px; }}
+  .checkbox-row {{ display:flex; align-items:center; gap:8px; margin-top:12px; }}
+  .checkbox-row input {{ width:auto; }}
+  .checkbox-row label {{ margin:0; color:#e8e8e8; }}
+  small {{ color:#888; display:block; margin-top:2px; }}
+  button {{ margin-top:24px; padding:10px 20px; background:#c0392b; color:#fff; border:none; border-radius:6px; font-size:1em; cursor:pointer; }}
+  .banner {{ padding:10px 14px; border-radius:6px; margin-bottom:16px; }}
+  .banner.ok {{ background:#1e3a24; border:1px solid #2d5a36; }}
+  .banner.error {{ background:#3a1e1e; border:1px solid #5a2d2d; }}
+  .instance-list {{ margin-top:8px; }}
+  .instance-row {{ display:flex; gap:8px; align-items:center; margin-top:8px; }}
+  .instance-row input {{ margin-top:0; }}
+  .instance-row input:first-child {{ flex:1.3; }}
+  .instance-row input:nth-child(2) {{ flex:1; }}
+  .remove-btn {{ margin-top:0; padding:8px 12px; background:#3a1e1e; color:#e8e8e8; border:1px solid #5a2d2d; border-radius:4px; font-size:1em; cursor:pointer; flex:none; }}
+  .add-btn {{ margin-top:10px; padding:8px 14px; background:#22262b; color:#e8e8e8; border:1px solid #3a3f45; border-radius:4px; font-size:0.9em; cursor:pointer; }}
+</style>
+</head>
+<body>
+<h1>🧹 Nettoyarr — Configuration</h1>
+{banner}
+<form method="POST" action="/config">
+
+  <h2>qBittorrent</h2>
+  <label>QBIT_URL<input type="text" name="QBIT_URL" value="{esc(cfg['QBIT_URL'])}"></label>
+  <label>QBIT_API_KEY <small>(recommandé, qBittorrent ≥ 5.2.0 — laisse vide pour utiliser user/pass)</small>
+    <input type="text" name="QBIT_API_KEY" value="{esc(cfg['QBIT_API_KEY'])}"></label>
+  <label>QBIT_USER <small>(repli si pas de clé API)</small><input type="text" name="QBIT_USER" value="{esc(cfg['QBIT_USER'])}"></label>
+  <label>QBIT_PASS<input type="text" name="QBIT_PASS" value="{esc(cfg['QBIT_PASS'])}"></label>
+
+  <h2>Seerr</h2>
+  <label>SEERR_URL<input type="text" name="SEERR_URL" value="{esc(cfg['SEERR_URL'])}"></label>
+  <label>SEERR_API_KEY<input type="text" name="SEERR_API_KEY" value="{esc(cfg['SEERR_API_KEY'])}"></label>
+
+  <h2>TMDB</h2>
+  <label>TMDB_API_KEY <small>(requis seulement pour la conversion tvdbId → tmdbId des séries)</small>
+    <input type="text" name="TMDB_API_KEY" value="{esc(cfg['TMDB_API_KEY'])}"></label>
+
+  <h2>Comportement</h2>
+  <div class="checkbox-row">
+    <input type="checkbox" id="DRY_RUN" name="DRY_RUN" {checked(cfg['DRY_RUN'])}>
+    <label for="DRY_RUN">DRY_RUN — ne rien supprimer réellement, log seulement</label>
+  </div>
+  <label>LOG_LEVEL
+    <select name="LOG_LEVEL" style="width:100%;padding:8px;margin-top:4px;background:#22262b;border:1px solid #3a3f45;border-radius:4px;color:#e8e8e8;">
+      {"".join(f'<option value="{lvl}" {"selected" if cfg["LOG_LEVEL"]==lvl else ""}>{lvl}</option>' for lvl in ("DEBUG","INFO","WARNING","ERROR"))}
+    </select>
+  </label>
+
+  <h2>Poll qBittorrent (optionnel, films uniquement)</h2>
+  <div class="checkbox-row">
+    <input type="checkbox" id="QBIT_POLL_ENABLED" name="QBIT_POLL_ENABLED" {checked(cfg['QBIT_POLL_ENABLED'])}>
+    <label for="QBIT_POLL_ENABLED">QBIT_POLL_ENABLED</label>
+  </div>
+  <label>QBIT_POLL_INTERVAL (secondes)<input type="number" name="QBIT_POLL_INTERVAL" value="{esc(cfg['QBIT_POLL_INTERVAL'])}"></label>
+  <label>QBIT_POLL_GRACE_SECONDS<input type="number" name="QBIT_POLL_GRACE_SECONDS" value="{esc(cfg['QBIT_POLL_GRACE_SECONDS'])}"></label>
+
+  <h2>Instances Radarr</h2>
+  <div id="RADARR-instances" class="instance-list">
+{radarr_rows}
+  </div>
+  <button type="button" class="add-btn" onclick="addInstance('RADARR')">+ Ajouter une instance Radarr</button>
+
+  <h2>Instances Sonarr</h2>
+  <div id="SONARR-instances" class="instance-list">
+{sonarr_rows}
+  </div>
+  <button type="button" class="add-btn" onclick="addInstance('SONARR')">+ Ajouter une instance Sonarr</button>
+
+  <br><button type="submit">💾 Sauvegarder et appliquer</button>
+</form>
+<script>
+function addInstance(prefix) {{
+  const container = document.getElementById(prefix + '-instances');
+  const row = document.createElement('div');
+  row.className = 'instance-row';
+
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.name = prefix + '_URL[]';
+  urlInput.placeholder = 'http://192.168.1.20:7878';
+
+  const keyInput = document.createElement('input');
+  keyInput.type = 'text';
+  keyInput.name = prefix + '_API_KEY[]';
+  keyInput.placeholder = 'clé API';
+
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'remove-btn';
+  delBtn.title = 'Retirer cette instance';
+  delBtn.textContent = '🗑';
+  delBtn.onclick = function () {{ row.remove(); }};
+
+  row.appendChild(urlInput);
+  row.appendChild(keyInput);
+  row.appendChild(delBtn);
+  container.appendChild(row);
+  urlInput.focus();
+}}
+</script>
+</body>
+</html>"""
+
+
 # ── Serveur HTTP ─────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -653,43 +907,52 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(msg.encode())
         elif self.path.startswith("/delete-by-hash"):
             self._handle_delete_by_hash()
+        elif self.path.startswith("/config"):
+            self._handle_config_get()
         else:
             self.send_response(404)
             self.end_headers()
 
     def _handle_delete_by_hash(self):
-        """Appelé par le bouton Tampermonkey dans la WebUI qBittorrent.
-        Action immédiate et explicite (clic utilisateur) : pas de délai de
-        grâce ni de vérification disque nécessaires, contrairement au
-        polling — l'intention de l'utilisateur est déjà sans ambiguïté.
+        """Appelé par le menu contextuel qBittorrent (userscript). Action
+        immédiate et explicite (clic utilisateur) : pas de délai de grâce ni
+        de vérification disque nécessaires, contrairement au polling —
+        l'intention de l'utilisateur est déjà sans ambiguïté.
 
         Essaie d'abord un match Radarr (film, un seul fichier suffit).
         Si aucun film ne correspond, essaie Sonarr : traite TOUS les
         fichiers du torrent (pas juste le premier trouvé), pour couvrir
-        un pack de saison complet en un seul clic."""
+        un pack de saison complet en un seul clic.
+
+        Réponse toujours en JSON — {"ok": true/false, ...} — pour que le
+        script côté navigateur puisse construire son propre message
+        (titre, cibles réellement nettoyées) sans avoir à parser du texte
+        libre destiné aux logs."""
         qs = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(qs)
         torrent_hash = (params.get("hash") or [""])[0].strip()
 
-        def respond(code, msg):
-            log.info(f"/delete-by-hash ({torrent_hash[:8]}) : {msg}")
+        def respond(code, payload):
+            log.info(f"/delete-by-hash ({torrent_hash[:8]}) : {payload}")
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(msg.encode())
+            self.wfile.write(body)
 
         if not torrent_hash:
-            respond(400, "Paramètre 'hash' manquant")
+            respond(400, {"ok": False, "error": "Paramètre 'hash' manquant"})
             return
         if not RADARR_INSTANCES and not SONARR_INSTANCES:
-            respond(500, "Ni RADARR_INSTANCES ni SONARR_INSTANCES ne sont configurés côté nettoyarr")
+            respond(500, {"ok": False, "error": "Ni RADARR_INSTANCES ni SONARR_INSTANCES ne sont configurés côté nettoyarr"})
             return
 
         try:
             files = qb.get_files(torrent_hash)
         except Exception as e:
-            respond(500, f"Torrent introuvable dans qBittorrent : {e}")
+            respond(500, {"ok": False, "error": f"Torrent introuvable dans qBittorrent : {e}"})
             return
 
         sizes = [f.get("size") for f in files if f.get("size")]
@@ -702,7 +965,16 @@ class Handler(BaseHTTPRequestHandler):
                     instance, movie = found
                     title = movie.get("title", "?")
                     radarr_delete_movie(instance, movie["id"])
-                    respond(200, f"« {title} » supprimé de Radarr ({instance['url']}), cascade en cours (qBit/Seerr)")
+                    # Seerr est nettoyé de façon asynchrone via le webhook
+                    # "On Movie Delete" déclenché par Radarr suite à cette
+                    # suppression (voir handle_item_delete) — donc bien réel,
+                    # même si pas fait directement dans cette requête.
+                    respond(200, {
+                        "ok": True,
+                        "kind": "movie",
+                        "title": title,
+                        "targets": ["Radarr", "qBittorrent", "NAS", "Seerr"],
+                    })
                     return
 
         # 2) Tentative série (Sonarr) — traite TOUS les fichiers du torrent,
@@ -732,12 +1004,104 @@ class Handler(BaseHTTPRequestHandler):
                     sonarr_maybe_unmonitor_season(instances_by_url[url], series_id, season_number, series_title)
 
                 summary = ", ".join(deleted_titles[:5]) + (f" (+{len(deleted_titles) - 5} autres)" if len(deleted_titles) > 5 else "")
-                respond(200, f"{len(matches)} épisode(s) supprimé(s) de Sonarr : {summary} — cascade en cours (qBit)")
+                # Seerr n'est volontairement PAS nettoyé ici : supprimer un ou
+                # plusieurs épisodes ne veut pas dire "je ne veux plus la
+                # série" (voir docstring en tête de fichier).
+                respond(200, {
+                    "ok": True,
+                    "kind": "episodes",
+                    "count": len(matches),
+                    "summary": summary,
+                    "targets": ["Sonarr", "qBittorrent", "NAS"],
+                })
                 return
 
-        respond(404, "Aucun film ou épisode Radarr/Sonarr ne correspond à ce torrent")
+        respond(404, {"ok": False, "error": "Aucun film ou épisode Radarr/Sonarr ne correspond à ce torrent"})
+
+    def _handle_config_get(self):
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        saved = params.get("saved", ["0"])[0] == "1"
+        error = (params.get("error") or [""])[0]
+        self._send_config_page(current_config(), saved=saved, error=error)
+
+    def _send_config_page(self, cfg, saved=False, error=""):
+        body = render_config_page(cfg, saved=saved, error=error).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_config_post(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        params = urllib.parse.parse_qs(raw.decode("utf-8"))
+
+        def field(name, default=""):
+            return (params.get(name) or [default])[0]
+
+        new_cfg = dict(current_config())  # base : config actuelle, on ne modifie que le formulaire soumis
+        new_cfg["QBIT_URL"] = field("QBIT_URL").strip()
+        new_cfg["QBIT_USER"] = field("QBIT_USER").strip()
+        new_cfg["QBIT_PASS"] = field("QBIT_PASS")
+        new_cfg["QBIT_API_KEY"] = field("QBIT_API_KEY").strip()
+        new_cfg["SEERR_URL"] = field("SEERR_URL").strip()
+        new_cfg["SEERR_API_KEY"] = field("SEERR_API_KEY").strip()
+        new_cfg["TMDB_API_KEY"] = field("TMDB_API_KEY").strip()
+        # Cases à cocher : absentes du POST si décochées, donc leur présence
+        # dans params (peu importe la valeur) veut dire "coché".
+        new_cfg["DRY_RUN"] = "DRY_RUN" in params
+        new_cfg["QBIT_POLL_ENABLED"] = "QBIT_POLL_ENABLED" in params
+
+        log_level = field("LOG_LEVEL", new_cfg["LOG_LEVEL"]).upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            self._send_config_page(new_cfg, error="LOG_LEVEL invalide (attendu DEBUG/INFO/WARNING/ERROR)")
+            return
+        new_cfg["LOG_LEVEL"] = log_level
+
+        try:
+            new_cfg["QBIT_POLL_INTERVAL"] = int(field("QBIT_POLL_INTERVAL", str(new_cfg["QBIT_POLL_INTERVAL"])))
+            new_cfg["QBIT_POLL_GRACE_SECONDS"] = int(field("QBIT_POLL_GRACE_SECONDS", str(new_cfg["QBIT_POLL_GRACE_SECONDS"])))
+        except ValueError:
+            self._send_config_page(new_cfg, error="QBIT_POLL_INTERVAL et QBIT_POLL_GRACE_SECONDS doivent être des nombres entiers")
+            return
+
+        def parse_instances(prefix):
+            """Reconstruit la liste [{"url":..., "api_key":...}] depuis les
+            champs répétés PREFIX_URL[] / PREFIX_API_KEY[] du formulaire —
+            une ligne vide (url ET clé vides) est simplement ignorée."""
+            urls = params.get(f"{prefix}_URL[]", [])
+            keys = params.get(f"{prefix}_API_KEY[]", [])
+            instances = []
+            for u, k in zip(urls, keys):
+                u, k = u.strip(), k.strip()
+                if not u and not k:
+                    continue
+                instances.append({"url": u, "api_key": k})
+            return instances
+
+        new_cfg["RADARR_INSTANCES"] = parse_instances("RADARR")
+        new_cfg["SONARR_INSTANCES"] = parse_instances("SONARR")
+
+        with CONFIG_LOCK:
+            try:
+                save_config(new_cfg)
+            except Exception as e:
+                self._send_config_page(new_cfg, error=f"Échec de la sauvegarde sur disque : {e}")
+                return
+            apply_config(new_cfg)
+
+        log.info("Config mise à jour depuis /config (appliquée à chaud, sans redémarrage)")
+        self.send_response(303)
+        self.send_header("Location", "/config?saved=1")
+        self.end_headers()
 
     def do_POST(self):
+        if self.path.startswith("/config"):
+            self._handle_config_post()
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:
@@ -765,6 +1129,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    apply_config(load_config())
+    log.info(f"Démarrage — DRY_RUN={DRY_RUN}")
+
     if QBIT_POLL_ENABLED:
         if not RADARR_INSTANCES:
             log.warning("QBIT_POLL_ENABLED=true mais RADARR_INSTANCES est vide, le poll ne trouvera jamais rien")
@@ -773,5 +1140,5 @@ if __name__ == "__main__":
         log.info("Poll qBit désactivé (QBIT_POLL_ENABLED=false)")
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
-    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /delete-by-hash, /file-delete, /item-delete)")
+    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /config, /delete-by-hash, /file-delete, /item-delete)")
     server.serve_forever()
