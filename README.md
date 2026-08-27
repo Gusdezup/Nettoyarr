@@ -144,9 +144,9 @@ comparer), et recharge complètement l'onglet qBittorrent après toute mise
 
 ## Architecture
 
-Le conteneur écoute sur le port `9999` et expose deux routes webhook, à
-configurer dans Radarr/Sonarr (`Settings > Connect > Webhook`) pour chaque
-instance (radarr, radarr-animes, radarr-enfants, sonarr, sonarr-enfants...) :
+Le conteneur écoute sur le port `9999` et expose les routes suivantes
+(configuration des webhooks Radarr/Sonarr détaillée dans la section
+suivante) :
 
 | Route             | Déclenché par                                                      | Rôle |
 |--------------------|----------------------------------------------------------------------|------|
@@ -174,6 +174,54 @@ chaque fichier de chaque torrent qBittorrent. Un hardlink garantit une
 taille identique à l'octet près, peu importe le reste du contenu du
 torrent — ça permet de retrouver et supprimer tous les doublons
 cross-seedés d'un coup.
+
+## Configuration des webhooks Radarr/Sonarr
+
+À répéter pour **chaque instance** (radarr, radarr-animes, sonarr,
+sonarr-enfants...) — chacune a besoin de ses 2 propres webhooks, Nettoyarr
+ne les crée pas automatiquement.
+
+### Dans Radarr
+
+`Settings > Connect > +` → choisir **Webhook** :
+
+1. **Premier webhook** (upgrades de qualité) :
+   - Name : au choix, ex. `Nettoyarr — File Delete`
+   - URL : `http://<ip-de-ton-nas>:9999/file-delete`
+   - Method : `POST`
+   - Cocher uniquement **On Movie File Delete**
+2. **Deuxième webhook** (suppressions complètes) :
+   - Name : au choix, ex. `Nettoyarr — Item Delete`
+   - URL : `http://<ip-de-ton-nas>:9999/item-delete`
+   - Method : `POST`
+   - Cocher uniquement **On Movie Delete**
+
+Clique sur **Test** avant de sauvegarder — un `200 OK` confirme que
+Radarr arrive à joindre le conteneur.
+
+### Dans Sonarr
+
+Même principe, `Settings > Connect > +` → **Webhook** :
+
+1. **Premier webhook** : URL `http://<ip-de-ton-nas>:9999/file-delete`,
+   coche uniquement **On Episode File Delete**.
+2. **Deuxième webhook** : URL `http://<ip-de-ton-nas>:9999/item-delete`,
+   coche uniquement **On Series Delete**.
+
+### Si l'authentification est activée (`AUTH_USER`/`AUTH_PASS`)
+
+Renseigne les mêmes identifiants dans les champs **Username**/**Password**
+du webhook, disponibles dans le même formulaire que l'URL — sinon Radarr/
+Sonarr recevront un `401` et les webhooks échoueront silencieusement (pas
+d'erreur visible ailleurs que dans les logs Radarr/Sonarr eux-mêmes et
+dans les logs du conteneur Nettoyarr).
+
+### Vérifier que ça fonctionne
+
+Avant de tester en conditions réelles, passe `LOG_LEVEL=DEBUG` sur
+`/config` et regarde les logs du conteneur (`docker logs -f nettoyarr`)
+lors d'une suppression de test — tu dois voir le payload JSON brut reçu,
+qui confirme que le webhook est bien arrivé et avec quels champs.
 
 ## Variables d'environnement
 
