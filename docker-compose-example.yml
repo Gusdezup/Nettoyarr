@@ -16,6 +16,18 @@ services:
       # cette valeur au lieu de repartir en mode suppression active par
       # défaut. À garder ici même une fois `/config` utilisé au quotidien.
 
+      # ── FORTEMENT RECOMMANDÉ SI CE PORT EST ACCESSIBLE AU-DELÀ DE TON
+      #    RÉSEAU LOCAL ────────────────────────────────────────────────
+      # - AUTH_USER=
+      # - AUTH_PASS=
+      # ↑ Tant que les deux sont vides, /config, /delete-by-hash,
+      # /file-delete et /item-delete sont accessibles sans authentification
+      # à quiconque atteint ce port (/health reste toujours ouvert). Si tu
+      # les renseignes, pense à mettre à jour aussi : les champs
+      # Username/Password des webhooks Radarr/Sonarr (Settings > Connect),
+      # et les constantes AUTH_USER/AUTH_PASS dans
+      # nettoyarr-qbit-button.user.js.
+
       # ── TOUT LE RESTE EST OPTIONNEL ──────────────────────────────────
       # Ces variables ne servent QUE de valeurs de départ pour le tout
       # premier démarrage (quand `data/config.json` n'existe pas encore).
@@ -30,14 +42,14 @@ services:
       #   b) ou pré-remplir ce qui t'arrange, pour un premier démarrage
       #      déjà fonctionnel (utile si tu veux versionner une base).
 
-      # - QBIT_URL=http://192.168.1.20:8081
+      # - QBIT_URL=http://localhost:8081
       # - QBIT_USER=
       # - QBIT_PASS=
       # - QBIT_API_KEY=
       # ↑ Authentification qBittorrent : soit QBIT_API_KEY (qBittorrent >=
       # 5.2.0, recommandé), soit QBIT_USER + QBIT_PASS en repli.
 
-      # - SEERR_URL=http://192.168.1.20:5055
+      # - SEERR_URL=http://localhost:5055
       # - SEERR_API_KEY=
 
       # - TMDB_API_KEY=
@@ -57,11 +69,11 @@ services:
 
       # - RADARR_INSTANCES=[]
       # ↑ JSON, une entrée par instance Radarr :
-      # [{"url":"http://192.168.1.20:7878","api_key":"..."},{"url":"http://192.168.1.20:7879","api_key":"..."}]
+      # [{"url":"http://localhost:7878","api_key":"..."},{"url":"http://localhost:7879","api_key":"..."}]
 
       # - SONARR_INSTANCES=[]
       # ↑ Même format pour Sonarr :
-      # [{"url":"http://192.168.1.20:8989","api_key":"..."}]
+      # [{"url":"http://localhost:8989","api_key":"..."}]
 
     volumes:
       # ── INDISPENSABLES ───────────────────────────────────────────────

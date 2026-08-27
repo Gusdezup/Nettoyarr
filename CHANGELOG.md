@@ -5,6 +5,32 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.1] - 2026-08-27
+
+### Added
+- `nettoyarr-qbit-button.user.js` : `NETTOYARR_URL`/`AUTH_USER`/`AUTH_PASS` ne sont plus codés en dur dans le script — ils sont désormais stockés dans le stockage de l'extension (`GM_setValue`/`GM_getValue`, attaché au script via `@namespace`), réglables via un nouveau menu "⚙️ Configurer Nettoyarr (URL / auth)" accessible depuis l'icône Tampermonkey/Violentmonkey. Coller une future mise à jour du script par-dessus l'ancienne ne réinitialise plus ces valeurs.
+
+### Changed
+- `@match`/`@connect` (adresse de qBittorrent) restent en dur dans les métadonnées — contrainte technique des userscripts, lus avant l'exécution du script — mais changent rarement une fois réglés, contrairement à l'URL Nettoyarr ou aux identifiants d'auth.
+
+### Fixed
+- `nettoyarr-qbit-button.user.js` : les noms de torrent longs sans espaces (uniquement des points, ex. `Titre.Serie.S01E12.1080p.WEB-Raws`) débordaient du cadre de la popup de confirmation/résultat au lieu de passer à la ligne, faute de point de coupure reconnu par le CSS par défaut. Ajout d'`overflow-wrap:anywhere` pour forcer le retour à la ligne même sans espace.
+
+### Docs
+- `README.md` : réécriture avec sections Installation rapide, Authentification, et Bouton qBittorrent (installation du userscript + configuration de l'URL/auth via le menu de l'extension). Mise à jour du tableau des variables d'environnement (ajout `AUTH_USER`/`AUTH_PASS`, `DRY_RUN` en tête, valeurs par défaut `localhost`).
+
+## [0.5.0] - 2026-08-27
+
+### Added
+- Authentification HTTP Basic, optionnelle, via `AUTH_USER`/`AUTH_PASS` (éditables depuis `/config`, comme le reste de la config). Protège `/config` (GET+POST), `/delete-by-hash`, `/file-delete` et `/item-delete` — `/health` reste toujours ouvert (aucune donnée sensible, utile pour un healthcheck Docker simple).
+- Bandeau d'avertissement persistant sur `/config` tant qu'`AUTH_USER`/`AUTH_PASS` sont vides (auth désactivée par défaut, pour ne pas casser les setups existants).
+- `nettoyarr-qbit-button.user.js` : constantes `AUTH_USER`/`AUTH_PASS` (vides par défaut) — envoie l'en-tête `Authorization: Basic` via `GM_xmlhttpRequest` si renseignées, sans déclencher la popup de login native du navigateur.
+- `docker-compose-example.yml` : section commentée documentant `AUTH_USER`/`AUTH_PASS`.
+
+### Notes
+- Compatible nativement avec les champs Username/Password des webhooks Radarr/Sonarr (`Settings > Connect`) — à renseigner côté Radarr/Sonarr si l'auth est activée côté Nettoyarr, sinon `/file-delete`/`/item-delete` répondront 401.
+- Comparaison des identifiants à temps constant (`hmac.compare_digest`) pour éviter une timing attack.
+
 ## [0.4.1] - 2026-08-27
 
 ### Fixed

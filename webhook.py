@@ -67,6 +67,8 @@ encore sur le disque, signe que seul le torrent a été retiré sans les
 fichiers). Sans ce montage, la vérification est ignorée avec un warning.
 """
 
+import base64
+import hmac
 import html
 import json
 import logging
@@ -108,6 +110,7 @@ CONFIG_KEYS = [
     "DRY_RUN", "LOG_LEVEL",
     "QBIT_POLL_ENABLED", "QBIT_POLL_INTERVAL", "QBIT_POLL_GRACE_SECONDS",
     "RADARR_INSTANCES", "SONARR_INSTANCES",
+    "AUTH_USER", "AUTH_PASS",
 ]
 
 
@@ -129,6 +132,8 @@ def _config_from_env():
         "QBIT_POLL_GRACE_SECONDS": int(os.environ.get("QBIT_POLL_GRACE_SECONDS", "300")),
         "RADARR_INSTANCES": json.loads(os.environ.get("RADARR_INSTANCES", "[]")),
         "SONARR_INSTANCES": json.loads(os.environ.get("SONARR_INSTANCES", "[]")),
+        "AUTH_USER": os.environ.get("AUTH_USER", ""),
+        "AUTH_PASS": os.environ.get("AUTH_PASS", ""),
     }
 
 
@@ -176,6 +181,7 @@ def apply_config(cfg):
     global DRY_RUN, LOG_LEVEL
     global QBIT_POLL_ENABLED, QBIT_POLL_INTERVAL, QBIT_POLL_GRACE_SECONDS
     global RADARR_INSTANCES, SONARR_INSTANCES
+    global AUTH_USER, AUTH_PASS
     global qb
 
     QBIT_URL = cfg["QBIT_URL"]
@@ -192,6 +198,8 @@ def apply_config(cfg):
     QBIT_POLL_GRACE_SECONDS = cfg["QBIT_POLL_GRACE_SECONDS"]
     RADARR_INSTANCES = cfg["RADARR_INSTANCES"]
     SONARR_INSTANCES = cfg["SONARR_INSTANCES"]
+    AUTH_USER = cfg["AUTH_USER"]
+    AUTH_PASS = cfg["AUTH_PASS"]
 
     logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     qb = QBClient(QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY)
@@ -211,6 +219,7 @@ def current_config():
         "QBIT_POLL_INTERVAL": QBIT_POLL_INTERVAL,
         "QBIT_POLL_GRACE_SECONDS": QBIT_POLL_GRACE_SECONDS,
         "RADARR_INSTANCES": RADARR_INSTANCES, "SONARR_INSTANCES": SONARR_INSTANCES,
+        "AUTH_USER": AUTH_USER, "AUTH_PASS": AUTH_PASS,
     }
 
 
@@ -759,6 +768,15 @@ def render_config_page(cfg, saved=False, error=""):
     elif saved:
         banner = '<div class="banner ok">✅ Config sauvegardée et appliquée à chaud — aucun redémarrage du conteneur nécessaire.</div>'
 
+    auth_warning = ""
+    if not (cfg["AUTH_USER"] or cfg["AUTH_PASS"]):
+        auth_warning = (
+            '<div class="banner warn">⚠️ Authentification désactivée — cette page et l\'endpoint '
+            '<code>/delete-by-hash</code> sont accessibles sans identifiants à quiconque atteint ce '
+            'port. Renseigne AUTH_USER/AUTH_PASS ci-dessous si ce port est exposé au-delà de ton '
+            'réseau local.</div>'
+        )
+
     radarr_rows = render_instance_rows(cfg["RADARR_INSTANCES"], "RADARR")
     sonarr_rows = render_instance_rows(cfg["SONARR_INSTANCES"], "SONARR")
 
@@ -787,6 +805,8 @@ def render_config_page(cfg, saved=False, error=""):
   .banner {{ padding:10px 14px; border-radius:6px; margin-bottom:16px; }}
   .banner.ok {{ background:#1e3a24; border:1px solid #2d5a36; }}
   .banner.error {{ background:#3a1e1e; border:1px solid #5a2d2d; }}
+  .banner.warn {{ background:#3a2e1e; border:1px solid #5a4a2d; }}
+  .banner code {{ background:#22262b; padding:1px 5px; border-radius:3px; }}
   .instance-list {{ margin-top:8px; }}
   .instance-row {{ display:flex; gap:8px; align-items:center; margin-top:8px; }}
   .instance-row input {{ margin-top:0; }}
@@ -799,7 +819,17 @@ def render_config_page(cfg, saved=False, error=""):
 <body>
 <h1>🧹 Nettoyarr — Configuration</h1>
 {banner}
+{auth_warning}
 <form method="POST" action="/config">
+
+  <h2>Authentification</h2>
+  <label>AUTH_USER <small>(laisser AUTH_USER et AUTH_PASS vides désactive l'authentification)</small>
+    <input type="text" name="AUTH_USER" value="{esc(cfg['AUTH_USER'])}"></label>
+  <label>AUTH_PASS<input type="text" name="AUTH_PASS" value="{esc(cfg['AUTH_PASS'])}"></label>
+  <small>Protège cette page, <code>/delete-by-hash</code>, <code>/file-delete</code> et <code>/item-delete</code>
+    (pas <code>/health</code>). Compatible avec les champs Username/Password des webhooks Radarr/Sonarr —
+    pense à les renseigner là-bas aussi si tu actives l'auth ici. Pense aussi à mettre à jour
+    AUTH_USER/AUTH_PASS dans le userscript qBittorrent.</small>
 
   <h2>qBittorrent</h2>
   <label>QBIT_URL<input type="text" name="QBIT_URL" value="{esc(cfg['QBIT_URL'])}"></label>
@@ -883,6 +913,50 @@ function addInstance(prefix) {{
 </html>"""
 
 
+# ── Authentification HTTP Basic ─────────────────────────────────────────────
+# Protège tout sauf /health (aucune donnée sensible, utile pour un healthcheck
+# Docker simple sans identifiants). Désactivée tant qu'AUTH_USER/AUTH_PASS
+# sont vides (comportement par défaut, pour ne pas casser les setups
+# existants) — mais un bandeau d'avertissement s'affiche alors sur /config
+# pour que ça ne passe pas inaperçu. Compatible nativement avec les champs
+# Username/Password des webhooks Radarr/Sonarr (Settings > Connect), et avec
+# GM_xmlhttpRequest côté userscript (en-tête Authorization envoyé directement,
+# sans déclencher la popup de login native du navigateur).
+def auth_enabled():
+    return bool(AUTH_USER or AUTH_PASS)
+
+
+def check_auth(handler):
+    """True si la requête est autorisée à continuer. Sinon, envoie déjà la
+    réponse 401 elle-même (avec WWW-Authenticate pour déclencher la popup de
+    login du navigateur en cas d'accès direct à /config) et renvoie False —
+    l'appelant doit alors simplement `return`."""
+    if not auth_enabled():
+        return True
+
+    header = handler.headers.get("Authorization", "")
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8")
+            user, _, password = decoded.partition(":")
+        except Exception:
+            user, password = "", ""
+        # Comparaison à temps constant : évite qu'un attaquant déduise les
+        # identifiants corrects octet par octet en mesurant le temps de
+        # réponse (timing attack) sur un simple ==.
+        if hmac.compare_digest(user, AUTH_USER) and hmac.compare_digest(password, AUTH_PASS):
+            return True
+
+    body = b"Authentification requise"
+    handler.send_response(401)
+    handler.send_header("WWW-Authenticate", 'Basic realm="Nettoyarr"')
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+    return False
+
+
 # ── Serveur HTTP ─────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -906,8 +980,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(msg.encode())
         elif self.path.startswith("/delete-by-hash"):
+            if not check_auth(self):
+                return
             self._handle_delete_by_hash()
         elif self.path.startswith("/config"):
+            if not check_auth(self):
+                return
             self._handle_config_get()
         else:
             self.send_response(404)
@@ -1042,6 +1120,8 @@ class Handler(BaseHTTPRequestHandler):
             return (params.get(name) or [default])[0]
 
         new_cfg = dict(current_config())  # base : config actuelle, on ne modifie que le formulaire soumis
+        new_cfg["AUTH_USER"] = field("AUTH_USER").strip()
+        new_cfg["AUTH_PASS"] = field("AUTH_PASS")
         new_cfg["QBIT_URL"] = field("QBIT_URL").strip()
         new_cfg["QBIT_USER"] = field("QBIT_USER").strip()
         new_cfg["QBIT_PASS"] = field("QBIT_PASS")
@@ -1099,7 +1179,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith("/config"):
+            if not check_auth(self):
+                return
             self._handle_config_post()
+            return
+
+        if (self.path.startswith("/file-delete") or self.path.startswith("/item-delete")) and not check_auth(self):
             return
 
         length = int(self.headers.get("Content-Length", 0))

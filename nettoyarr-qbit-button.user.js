@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.4.1
+// @version      0.5.1
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // ⚠️ À PERSONNALISER : remplace TON_URL_QBITTORRENT (ci-dessous) par
 // l'adresse IP ou le nom d'hôte réel de ton serveur qBittorrent, sur les
-// 2 lignes @match et @connect. Voir aussi NETTOYARR_URL plus bas dans le
-// script, pour l'adresse de ton conteneur Nettoyarr (port 9999).
+// 2 lignes @match et @connect. L'URL de Nettoyarr et les identifiants
+// d'authentification (si activée) se règlent séparément, via le menu de
+// ce script dans Tampermonkey/Violentmonkey — voir plus bas dans le code.
 // @match        http://TON_URL_QBITTORRENT:8081/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // @connect      TON_URL_QBITTORRENT
 // @run-at       document-idle
@@ -17,8 +21,36 @@
 (function () {
   "use strict";
 
-  // ⚠️ À personnaliser (voir en-tête du script) — adresse de TON conteneur Nettoyarr
-  const NETTOYARR_URL = "http://TON_URL_NETTOYARR:9999";
+  // ── Config persistante (survit au remplacement du corps du script) ─────
+  // NETTOYARR_URL / AUTH_USER / AUTH_PASS sont stockés dans le stockage de
+  // l'extension (attaché à ce script via @namespace), pas dans le code lui-
+  // même — coller une future mise à jour par-dessus ne les efface donc pas.
+  // Réglage : clic sur l'icône Tampermonkey/Violentmonkey dans la barre
+  // d'outils → menu de ce script → "⚙️ Configurer Nettoyarr (URL / auth)".
+  // @match et @connect (l'adresse de qBittorrent), eux, restent en dur dans
+  // les métadonnées ci-dessus — contrainte technique des userscripts, lus
+  // avant même l'exécution — mais changent rarement une fois réglés.
+  function getConfig() {
+    return {
+      nettoyarrUrl: GM_getValue("nettoyarrUrl", "http://TON_URL_NETTOYARR:9999"),
+      authUser: GM_getValue("authUser", ""),
+      authPass: GM_getValue("authPass", ""),
+    };
+  }
+
+  GM_registerMenuCommand("⚙️ Configurer Nettoyarr (URL / auth)", () => {
+    const cfg = getConfig();
+    const url = prompt("URL de ton conteneur Nettoyarr :", cfg.nettoyarrUrl);
+    if (url === null) return; // annulé
+    const user = prompt("AUTH_USER (laisser vide si authentification désactivée) :", cfg.authUser);
+    if (user === null) return;
+    const pass = prompt("AUTH_PASS (laisser vide si authentification désactivée) :", cfg.authPass);
+    if (pass === null) return;
+    GM_setValue("nettoyarrUrl", url.trim());
+    GM_setValue("authUser", user.trim());
+    GM_setValue("authPass", pass);
+    alert("🧹 Nettoyarr : config sauvegardée.");
+  });
 
   const MENU_ID = "torrentsTableMenu";
   const ITEM_ID = "nettoyarrMenuItem";
@@ -47,7 +79,7 @@
 
       const body = document.createElement("div");
       body.textContent = message;
-      body.style.cssText = "font-size:16px;white-space:pre-line;line-height:1.5;margin-bottom:20px;";
+      body.style.cssText = "font-size:16px;white-space:pre-line;line-height:1.5;margin-bottom:20px;overflow-wrap:anywhere;";
 
       const row = document.createElement("div");
       row.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
@@ -105,11 +137,21 @@
   }
 
   // ── Appel nettoyarr (cross-origin, CSP contourné via GM_xmlhttpRequest) ──
+  // Si AUTH_USER/AUTH_PASS sont renseignés, l'en-tête Authorization est
+  // envoyé directement dans la requête — GM_xmlhttpRequest permet ça sans
+  // déclencher la popup de login native du navigateur (contrairement à un
+  // fetch() classique face à un 401).
   function deleteHash(hash) {
+    const cfg = getConfig();
+    const headers = {};
+    if (cfg.authUser || cfg.authPass) {
+      headers["Authorization"] = "Basic " + btoa(`${cfg.authUser}:${cfg.authPass}`);
+    }
     return new Promise((resolve) => {
       GM_xmlhttpRequest({
         method: "GET",
-        url: `${NETTOYARR_URL}/delete-by-hash?hash=${encodeURIComponent(hash)}`,
+        url: `${cfg.nettoyarrUrl}/delete-by-hash?hash=${encodeURIComponent(hash)}`,
+        headers,
         onload: (res) => {
           let data = null;
           try {
