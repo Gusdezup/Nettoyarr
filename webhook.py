@@ -75,6 +75,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -203,6 +204,7 @@ def apply_config(cfg):
 
     logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     qb = QBClient(QBIT_URL, QBIT_USER, QBIT_PASS, QBIT_API_KEY)
+    qbit_invalidate_cache()  # l'instance qBit a pu changer : le cache n'est plus fiable
 
 
 def current_config():
@@ -273,6 +275,12 @@ class QBClient:
         self.ensure_login()
         return json.loads(self._req("/api/v2/torrents/info"))
 
+    def get_torrent(self, hash_):
+        """Infos d'un torrent précis, ou None s'il n'existe plus dans qBit."""
+        self.ensure_login()
+        lst = json.loads(self._req(f"/api/v2/torrents/info?hashes={hash_}"))
+        return lst[0] if lst else None
+
     def get_files(self, hash_):
         self.ensure_login()
         try:
@@ -293,10 +301,99 @@ class QBClient:
             {"hashes": hashes_param, "deleteFiles": "true"},
             method="POST",
         )
+        qbit_invalidate_cache(hashes)
         log.info(f"Torrent(s) supprimé(s) dans qBittorrent : {hashes_param}")
 
 
 qb = None  # instancié par apply_config(), au démarrage puis à chaque sauvegarde /config
+
+
+# ── Cache des listes de fichiers qBittorrent ────────────────────────────────
+# La liste des fichiers d'un torrent est immuable pour un hash donné : on ne
+# la demande donc qu'UNE fois à qBittorrent, puis on la garde en mémoire.
+# Sans ce cache, chaque recherche par taille faisait un appel
+# /api/v2/torrents/files par torrent (~1300 appels, plus de 3 minutes sur
+# le NAS), et ce à CHAQUE épisode supprimé d'un pack de saison.
+# Le verrou garantit qu'un seul scan tourne à la fois : les autres
+# recherches attendent puis réutilisent le cache tout juste rempli.
+QBIT_FILES_CACHE = {}          # hash -> [(taille, nom_fichier), ...]
+QBIT_FILES_LOCK = threading.Lock()
+QBIT_SCAN_PROGRESS = {"done": 0, "total": 0}  # lisible par les jobs en attente
+
+
+def qbit_invalidate_cache(hashes=None):
+    if hashes is None:
+        QBIT_FILES_CACHE.clear()
+    else:
+        for h in hashes:
+            QBIT_FILES_CACHE.pop(h, None)
+
+
+def _qbit_fill_cache(torrents, progress=None):
+    """Complète le cache pour les torrents pas encore connus.
+    À appeler avec QBIT_FILES_LOCK détenu."""
+    todo = [t for t in torrents if t["hash"] not in QBIT_FILES_CACHE]
+    QBIT_SCAN_PROGRESS["done"], QBIT_SCAN_PROGRESS["total"] = 0, len(todo)
+    try:
+        for i, t in enumerate(todo, 1):
+            files = qb.get_files(t["hash"])
+            # Jamais de liste vide en cache (métadonnées pas encore reçues,
+            # erreur API…) : on retentera au prochain scan.
+            if files:
+                QBIT_FILES_CACHE[t["hash"]] = [
+                    (f.get("size"), os.path.basename(f.get("name", ""))) for f in files
+                ]
+            QBIT_SCAN_PROGRESS["done"] = i
+            if progress and (i % 10 == 0 or i == len(todo)):
+                progress(i, len(todo))
+    finally:
+        QBIT_SCAN_PROGRESS["done"] = QBIT_SCAN_PROGRESS["total"] = 0
+
+
+def qbit_find_torrents_by_sizes(target_sizes, progress=None, wait_cb=None):
+    """Renvoie {hash: (nom_torrent, [fichiers correspondants])} pour tous
+    les torrents qui contiennent au moins un fichier dont la taille est
+    EXACTEMENT l'une de target_sizes (cf. find_and_delete_by_sizes)."""
+    targets = {s for s in target_sizes if s}
+    if not targets:
+        return {}
+    min_target = min(targets)
+
+    # Un autre scan est peut-être en cours (préchargement au démarrage,
+    # webhook concurrent) : on attend, en remontant sa progression.
+    while not QBIT_FILES_LOCK.acquire(timeout=1):
+        if wait_cb:
+            wait_cb(QBIT_SCAN_PROGRESS["done"], QBIT_SCAN_PROGRESS["total"])
+    try:
+        torrents = qb.get_torrents()
+        live = {t["hash"] for t in torrents}
+        for h in [h for h in QBIT_FILES_CACHE if h not in live]:
+            QBIT_FILES_CACHE.pop(h, None)
+        # Pré-filtre gratuit : un torrent plus petit que le plus petit
+        # fichier recherché ne peut pas le contenir.
+        candidates = [t for t in torrents if (t.get("total_size") or t.get("size") or 0) >= min_target]
+        _qbit_fill_cache(candidates, progress)
+    finally:
+        QBIT_FILES_LOCK.release()
+
+    matches = {}
+    for t in candidates:
+        for size, fname in QBIT_FILES_CACHE.get(t["hash"], []):
+            if size in targets:
+                matches.setdefault(t["hash"], (t.get("name", "?"), []))[1].append(fname)
+    return matches
+
+
+def qbit_cache_warmup():
+    """Préchargement au démarrage, en arrière-plan : le premier clic sur le
+    bouton qBit n'a alors plus à payer le scan complet."""
+    try:
+        t0 = time.time()
+        with QBIT_FILES_LOCK:
+            _qbit_fill_cache(qb.get_torrents())
+        log.info(f"Cache qBit préchargé : {len(QBIT_FILES_CACHE)} torrent(s) en {time.time() - t0:.0f}s")
+    except Exception as e:
+        log.warning(f"Préchargement du cache qBit impossible ({e}) — il se remplira à la première recherche")
 
 
 # ── Client Radarr (pour le polling qBit uniquement) ─────────────────────────
@@ -334,6 +431,95 @@ def find_movie_by_file_size(size):
     return None
 
 
+def _noop_step(*_args, **_kwargs):
+    pass
+
+
+def arr_get(instance, path, timeout=20):
+    req = urllib.request.Request(f"{instance['url'].rstrip('/')}{path}")
+    req.add_header("X-Api-Key", instance["api_key"])
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode()
+        return json.loads(raw) if raw.strip() else None
+
+
+def arr_history_by_download_id(instance, torrent_hash):
+    """Historique Radarr/Sonarr lié à ce torrent (downloadId = hash du
+    torrent en majuscules). Ne couvre que le torrent réellement grabbé par
+    l'*arr : un doublon injecté par cross-seed n'y figure jamais, d'où les
+    replis ensuite. Filtré côté client aussi, au cas où une version de
+    l'API ignorerait le paramètre downloadId."""
+    try:
+        data = arr_get(instance, f"/api/v3/history?downloadId={torrent_hash.upper()}&pageSize=50")
+    except Exception as e:
+        log.debug(f"  Historique indisponible sur {instance['url']} : {e}")
+        return []
+    records = data.get("records", []) if isinstance(data, dict) else (data or [])
+    return [r for r in records if (r.get("downloadId") or "").lower() == torrent_hash.lower()]
+
+
+def arr_parse_title(instance, title):
+    """Demande à Radarr/Sonarr d'identifier un nom de release (/api/v3/parse).
+    Renvoie {"movie": ...} ou {"series": ...} si l'item est dans la bibliothèque."""
+    try:
+        return arr_get(instance, "/api/v3/parse?title=" + urllib.parse.quote(title)) or {}
+    except Exception as e:
+        log.debug(f"  Parse impossible sur {instance['url']} : {e}")
+        return {}
+
+
+def radarr_find_movie(torrent_hash, torrent_name, sizes, step=_noop_step):
+    """Identifie le film correspondant à un torrent, du plus rapide au plus
+    lent : historique Radarr (downloadId), puis analyse du nom de release,
+    puis parcours complet des bibliothèques en dernier recours.
+    Garde-fou inchangé : quel que soit le chemin, le film n'est retenu que si
+    la taille de son fichier est EXACTEMENT celle d'un fichier du torrent."""
+    size_set = set(sizes)
+
+    def size_matches(movie):
+        return (movie.get("movieFile") or {}).get("size") in size_set
+
+    def fetch(instance, movie_id):
+        try:
+            return arr_get(instance, f"/api/v3/movie/{movie_id}")
+        except Exception as e:
+            log.debug(f"  Lecture film id={movie_id} impossible sur {instance['url']} : {e}")
+            return None
+
+    step("Recherche du film : historique Radarr")
+    for instance in RADARR_INSTANCES:
+        movie_ids = {r.get("movieId") for r in arr_history_by_download_id(instance, torrent_hash) if r.get("movieId")}
+        for movie_id in movie_ids:
+            movie = fetch(instance, movie_id)
+            if movie and size_matches(movie):
+                log.info(f"  Film identifié via l'historique : « {movie.get('title', '?')} » sur {instance['url']}")
+                return instance, movie
+
+    if torrent_name:
+        step("Recherche du film : analyse du nom de release")
+        for instance in RADARR_INSTANCES:
+            parsed = (arr_parse_title(instance, torrent_name) or {}).get("movie") or {}
+            if parsed.get("id"):
+                movie = fetch(instance, parsed["id"])
+                if movie and size_matches(movie):
+                    log.info(f"  Film identifié via le nom : « {movie.get('title', '?')} » sur {instance['url']}")
+                    return instance, movie
+
+    total = len(RADARR_INSTANCES)
+    for i, instance in enumerate(RADARR_INSTANCES, 1):
+        step("Recherche du film : bibliothèques Radarr complètes", i - 1, total)
+        try:
+            movies = radarr_get_movies(instance)
+        except Exception as e:
+            log.warning(f"  Impossible d'interroger Radarr ({instance['url']}) : {e}")
+            continue
+        for m in movies:
+            if size_matches(m):
+                log.info(f"  Film identifié via la bibliothèque complète : « {m.get('title', '?')} » sur {instance['url']}")
+                return instance, m
+    return None
+
+
 # ── Client Sonarr (séries) ───────────────────────────────────────────────────
 def sonarr_get_series(instance):
     req = urllib.request.Request(f"{instance['url'].rstrip('/')}/api/v3/series")
@@ -363,35 +549,95 @@ def sonarr_get_episode_files(instance, series_id):
         return json.loads(r.read().decode())
 
 
-def sonarr_build_file_index():
+def sonarr_build_file_index(progress=None):
     """Construit un index {taille_octets: (instance, series, episode,
     episodeFile)} pour toutes les instances Sonarr configurées. Un seul
     passage sur toute la bibliothèque, réutilisé ensuite pour chaque
     fichier d'un même torrent — indispensable pour les packs de saison
     (jusqu'à 24 fichiers) sans rescanner Sonarr 24 fois."""
     index = {}
+    work = []
     for instance in SONARR_INSTANCES:
         try:
-            series_list = sonarr_get_series(instance)
+            work.extend((instance, s) for s in sonarr_get_series(instance))
         except Exception as e:
             log.warning(f"  Impossible d'interroger Sonarr ({instance['url']}) : {e}")
+    for n, (instance, s) in enumerate(work, 1):
+        if progress and (n % 5 == 0 or n == len(work)):
+            progress(n, len(work))
+        try:
+            episodes = sonarr_get_episodes(instance, s["id"])
+            files = sonarr_get_episode_files(instance, s["id"])
+        except Exception as e:
+            log.warning(f"  Impossible de lire les épisodes de « {s.get('title','?')} » : {e}")
             continue
-        for s in series_list:
-            try:
-                episodes = sonarr_get_episodes(instance, s["id"])
-                files = sonarr_get_episode_files(instance, s["id"])
-            except Exception as e:
-                log.warning(f"  Impossible de lire les épisodes de « {s.get('title','?')}' » : {e}")
-                continue
-            episodes_by_file_id = {
-                e["episodeFileId"]: e for e in episodes if e.get("episodeFileId")
-            }
-            for ef in files:
-                size = ef.get("size")
-                episode = episodes_by_file_id.get(ef.get("id"))
-                if size and episode:
-                    index[size] = (instance, s, episode, ef)
+        episodes_by_file_id = {
+            e["episodeFileId"]: e for e in episodes if e.get("episodeFileId")
+        }
+        for ef in files:
+            size = ef.get("size")
+            episode = episodes_by_file_id.get(ef.get("id"))
+            if size and episode:
+                index[size] = (instance, s, episode, ef)
     return index
+
+
+def sonarr_matches_for_series(instance, series, size_set):
+    """Épisodes d'UNE série dont le fichier a exactement l'une des tailles."""
+    episodes = sonarr_get_episodes(instance, series["id"])
+    files = sonarr_get_episode_files(instance, series["id"])
+    by_file_id = {e["episodeFileId"]: e for e in episodes if e.get("episodeFileId")}
+    out = []
+    for ef in files:
+        episode = by_file_id.get(ef.get("id"))
+        if episode and ef.get("size") in size_set:
+            out.append((instance, series, episode, ef))
+    return out
+
+
+def sonarr_find_episodes(torrent_hash, torrent_name, sizes, step=_noop_step):
+    """Même logique que radarr_find_movie : historique (downloadId), puis
+    analyse du nom de release, puis index complet de toutes les séries en
+    dernier recours. Le match final reste toujours la taille exacte."""
+    size_set = set(sizes)
+    tried = set()
+
+    def try_series(instance, series_id):
+        key = (instance["url"], series_id)
+        if key in tried:
+            return []
+        tried.add(key)
+        try:
+            series = sonarr_get_series_detail(instance, series_id)
+            return sonarr_matches_for_series(instance, series, size_set)
+        except Exception as e:
+            log.warning(f"  Lecture de la série id={series_id} impossible sur {instance['url']} : {e}")
+            return []
+
+    step("Recherche des épisodes : historique Sonarr")
+    for instance in SONARR_INSTANCES:
+        series_ids = {r.get("seriesId") for r in arr_history_by_download_id(instance, torrent_hash) if r.get("seriesId")}
+        for series_id in series_ids:
+            found = try_series(instance, series_id)
+            if found:
+                log.info(f"  Série identifiée via l'historique : « {found[0][1].get('title', '?')} » sur {instance['url']}")
+                return found
+
+    if torrent_name:
+        step("Recherche des épisodes : analyse du nom de release")
+        for instance in SONARR_INSTANCES:
+            parsed = (arr_parse_title(instance, torrent_name) or {}).get("series") or {}
+            if parsed.get("id"):
+                found = try_series(instance, parsed["id"])
+                if found:
+                    log.info(f"  Série identifiée via le nom : « {found[0][1].get('title', '?')} » sur {instance['url']}")
+                    return found
+
+    step("Recherche des épisodes : bibliothèques Sonarr complètes")
+    index = sonarr_build_file_index(
+        progress=lambda i, n: step("Recherche des épisodes : bibliothèques Sonarr complètes", i, n)
+    )
+    return [index[s] for s in sizes if s in index]
 
 
 def sonarr_delete_episode_file(instance, episode_file_id):
@@ -552,10 +798,10 @@ def qbit_poll_loop():
         time.sleep(QBIT_POLL_INTERVAL)
 
 
-def find_and_delete_by_file_size(target_size, label=""):
+def find_and_delete_by_sizes(target_sizes, label="", progress=None, wait_cb=None):
     """Cherche tous les torrents (y compris doublons cross-seed) contenant
-    au moins un fichier de taille EXACTEMENT identique à target_size, et
-    les supprime.
+    au moins un fichier de taille EXACTEMENT identique à l'une des
+    target_sizes, et les supprime. Renvoie {hash: (nom, [fichiers])}.
 
     On compare fichier par fichier, jamais la taille totale d'un torrent :
     un torrent peut contenir des extras (sample.mkv, nfo) que Radarr/Sonarr
@@ -564,24 +810,24 @@ def find_and_delete_by_file_size(target_size, label=""):
     episodeFile.size qui, eux, ne comptent que le fichier vidéo réellement
     hardlinké. Un hardlink garantit un octet-pour-octet identique sur ce
     fichier précis, peu importe le reste du contenu du torrent."""
-    if not target_size:
-        log.warning(f"  Pas de taille exploitable dans le payload{f' ({label})' if label else ''}, abandon du matching qBit")
-        return
+    sizes = [s for s in target_sizes if s]
+    if not sizes:
+        log.warning(f"  Pas de taille exploitable{f' ({label})' if label else ''}, abandon du matching qBit")
+        return {}
 
-    matches = []
-    for t in qb.get_torrents():
-        for f in qb.get_files(t["hash"]):
-            if f.get("size") == target_size:
-                matches.append((t["hash"], t["name"], os.path.basename(f.get("name", ""))))
-                break
-
+    matches = qbit_find_torrents_by_sizes(sizes, progress=progress, wait_cb=wait_cb)
     if not matches:
-        log.info(f"  Aucun torrent qBit ne correspond à une taille de {target_size} octets")
-        return
+        log.info(f"  Aucun torrent qBit ne correspond{f' à {label}' if label else ''} (tailles : {sizes[:5]})")
+        return {}
 
-    for h, name, fname in matches:
-        log.info(f"  Match trouvé (fichier {fname}, taille identique) : {name} ({h[:8]})")
-    qb.delete_torrents([h for h, _, _ in matches])
+    for h, (name, fnames) in matches.items():
+        log.info(f"  Match trouvé ({len(fnames)} fichier(s), ex. {fnames[0]}) : {name} ({h[:8]})")
+    qb.delete_torrents(list(matches))
+    return matches
+
+
+def find_and_delete_by_file_size(target_size, label=""):
+    return find_and_delete_by_sizes([target_size], label=label)
 
 
 # ── Client HTTP générique (arr / Seerr / TMDB) ──────────────────────────────
@@ -957,6 +1203,215 @@ def check_auth(handler):
     return False
 
 
+# ── Suppression depuis qBittorrent (bouton userscript) : jobs suivis ────────
+# /delete-by-hash?async=1 lance le nettoyage en arrière-plan et répond
+# immédiatement avec un job_id ; le userscript interroge ensuite /job?id=…
+# chaque seconde pour afficher l'étape en cours et une vraie progression.
+# Sans async=1, la requête attend la fin et renvoie le résultat directement
+# (comportement historique, pratique pour curl).
+# Les jobs sont exécutés UN PAR UN (DELETE_LOCK) : deux torrents d'une même
+# saison sélectionnés ensemble ne se marchent plus dessus.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+DELETE_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 3600
+
+
+class Job:
+    def __init__(self, torrent_hash):
+        self.id = uuid.uuid4().hex[:12]
+        self.hash = torrent_hash
+        self.created = self.updated = time.time()
+        self.state = "queued"  # queued → running → done
+        self.step = "En attente…"
+        self.current = None
+        self.total = None
+        self.http_status = None
+        self.result = None
+        self.done_event = threading.Event()
+
+    def update(self, step, current=None, total=None):
+        self.step, self.current, self.total = step, current, total
+        self.updated = time.time()
+
+    def finish(self, http_status, result):
+        self.http_status, self.result = http_status, result
+        self.state = "done"
+        self.updated = time.time()
+        self.done_event.set()
+
+    def to_dict(self):
+        now = time.time()
+        percent = None
+        if self.total:
+            percent = max(0, min(100, round(100 * (self.current or 0) / self.total)))
+        return {
+            "ok": True, "id": self.id, "hash": self.hash, "state": self.state,
+            "step": self.step, "current": self.current, "total": self.total,
+            "percent": percent,
+            "elapsed": round(now - self.created),
+            "idle": round(now - self.updated),  # secondes sans nouvelle progression
+            "result": self.result,
+        }
+
+
+def create_delete_job(torrent_hash):
+    job = Job(torrent_hash)
+    with JOBS_LOCK:
+        now = time.time()
+        for jid in [j for j, x in JOBS.items() if x.state == "done" and now - x.updated > JOB_TTL_SECONDS]:
+            JOBS.pop(jid, None)
+        JOBS[job.id] = job
+    threading.Thread(target=run_delete_job, args=(job,), daemon=True).start()
+    return job
+
+
+def run_delete_job(job):
+    if not DELETE_LOCK.acquire(blocking=False):
+        job.update("En attente de la fin du nettoyage précédent…")
+        DELETE_LOCK.acquire()
+    try:
+        job.state = "running"
+        code, payload = delete_by_hash(job.hash, job.update)
+    except Exception as e:
+        log.exception(f"/delete-by-hash ({job.hash[:8]}) : erreur inattendue")
+        code, payload = 500, {"ok": False, "error": f"Erreur interne nettoyarr : {e}"}
+    finally:
+        DELETE_LOCK.release()
+    log.info(f"/delete-by-hash ({job.hash[:8]}) : {payload}")
+    job.finish(code, payload)
+
+
+def delete_by_hash(torrent_hash, step=_noop_step):
+    """Action immédiate et explicite (clic utilisateur) : pas de délai de
+    grâce ni de vérification disque, contrairement au polling.
+
+    Film d'abord (Radarr, un seul fichier suffit), puis séries (Sonarr, TOUS
+    les fichiers du torrent, pour couvrir un pack de saison en un clic).
+    Les torrents qBit correspondants (doublons cross-seed compris) sont
+    supprimés directement ici, sans attendre le webhook de l'*arr — le
+    webhook repassera derrière sans rien trouver, ce qui est sans effet.
+
+    Renvoie (code_http, payload_json)."""
+    if not RADARR_INSTANCES and not SONARR_INSTANCES:
+        return 500, {"ok": False, "error": "Ni RADARR_INSTANCES ni SONARR_INSTANCES ne sont configurés côté nettoyarr"}
+
+    step("Lecture du torrent dans qBittorrent")
+    try:
+        torrent = qb.get_torrent(torrent_hash)
+    except Exception as e:
+        return 500, {"ok": False, "error": f"qBittorrent injoignable : {e}"}
+    if not torrent:
+        # Cas typique : doublon cross-seed d'un torrent traité juste avant
+        # dans la même sélection, déjà supprimé par ce nettoyage.
+        return 200, {"ok": True, "kind": "gone",
+                     "message": "déjà absent de qBittorrent (doublon nettoyé juste avant ?)"}
+
+    torrent_name = torrent.get("name", "")
+    cached = QBIT_FILES_CACHE.get(torrent_hash)
+    if cached:
+        sizes = sorted({size for size, _ in cached if size})
+    else:
+        sizes = sorted({f.get("size") for f in qb.get_files(torrent_hash) if f.get("size")})
+    if not sizes:
+        return 404, {"ok": False, "error": "Liste de fichiers vide (métadonnées pas encore reçues ?)"}
+
+    def qbit_progress(i, n):
+        step("Nettoyage qBittorrent : analyse des torrents", i, n)
+
+    def qbit_wait(i, n):
+        step("Nettoyage qBittorrent : attente d'une analyse en cours", i or None, n or None)
+
+    # 1) Film (Radarr)
+    if RADARR_INSTANCES:
+        found = radarr_find_movie(torrent_hash, torrent_name, sizes, step)
+        if found:
+            instance, movie = found
+            title = movie.get("title", "?")
+            movie_size = (movie.get("movieFile") or {}).get("size")
+
+            def radarr_action():
+                step(f"Suppression de « {title} » dans Radarr")
+                radarr_delete_movie(instance, movie["id"])
+
+            removed = qbit_cleanup_around([movie_size], title, radarr_action, step, qbit_progress, qbit_wait)
+            # Seerr est nettoyé par le webhook "On Movie Delete" que Radarr
+            # déclenche suite à cette suppression (voir handle_item_delete).
+            return 200, {"ok": True, "kind": "movie", "title": title, "torrents": removed,
+                         "targets": ["Radarr", "qBittorrent", "NAS", "Seerr"]}
+
+    # 2) Série (Sonarr)
+    if SONARR_INSTANCES:
+        matches, seen = [], set()
+        for m in sonarr_find_episodes(torrent_hash, torrent_name, sizes, step):
+            key = (m[0]["url"], m[3]["id"])
+            if key not in seen:
+                seen.add(key)
+                matches.append(m)
+
+        if matches:
+            total = len(matches)
+            deleted_titles = []
+
+            def sonarr_action():
+                touched_seasons = set()  # (instance_url, series_id, season_number, titre)
+                for i, (instance, series, episode, ep_file) in enumerate(matches, 1):
+                    step("Suppression des épisodes dans Sonarr", i - 1, total)
+                    sonarr_delete_episode_file(instance, ep_file["id"])
+                    sonarr_set_episodes_monitored(instance, [episode["id"]], False)
+                    touched_seasons.add((instance["url"], series["id"], ep_file.get("seasonNumber"), series.get("title", "?")))
+                    season_num, ep_num = ep_file.get("seasonNumber"), episode.get("episodeNumber")
+                    if isinstance(season_num, int) and isinstance(ep_num, int):
+                        deleted_titles.append(f"{series.get('title', '?')} S{season_num:02d}E{ep_num:02d}")
+                    else:
+                        deleted_titles.append(series.get("title", "?"))
+                step("Suppression des épisodes dans Sonarr", total, total)
+
+                step("Vérification des saisons dans Sonarr")
+                instances_by_url = {inst["url"]: inst for inst in SONARR_INSTANCES}
+                for url, series_id, season_number, series_title in touched_seasons:
+                    sonarr_maybe_unmonitor_season(instances_by_url[url], series_id, season_number, series_title)
+
+            removed = qbit_cleanup_around(
+                [m[3].get("size") for m in matches], matches[0][1].get("title", ""),
+                sonarr_action, step, qbit_progress, qbit_wait,
+            )
+
+            summary = ", ".join(deleted_titles[:5]) + (f" (+{len(deleted_titles) - 5} autres)" if len(deleted_titles) > 5 else "")
+            # Seerr volontairement PAS nettoyé ici (voir docstring en tête).
+            return 200, {"ok": True, "kind": "episodes", "count": total, "summary": summary,
+                         "torrents": removed, "targets": ["Sonarr", "qBittorrent", "NAS"]}
+
+    return 404, {"ok": False, "error": "Aucun film ou épisode Radarr/Sonarr ne correspond à ce torrent"}
+
+
+def qbit_cleanup_around(sizes, label, arr_action, step, qbit_progress, qbit_wait):
+    """Repère les torrents qBit correspondants AVANT l'action côté *arr,
+    puis les supprime APRÈS. Le repérage préalable (instantané grâce au
+    cache) donne un décompte fiable : sinon le webhook que l'*arr déclenche
+    pendant la suppression nettoie qBit en premier, et le job ne voyait plus
+    rien (« 0 torrent » alors que tout avait bien été supprimé).
+    Renvoie le nombre total de torrents supprimés."""
+    step("Nettoyage qBittorrent : repérage des torrents")
+    found = qbit_find_torrents_by_sizes(sizes, progress=qbit_progress, wait_cb=qbit_wait)
+    arr_action()
+    step("Nettoyage qBittorrent")
+    if found:
+        for h, (name, fnames) in found.items():
+            log.info(f"  Match trouvé ({len(fnames)} fichier(s), ex. {fnames[0]}) : {name} ({h[:8]})")
+        qb.delete_torrents(list(found))  # sans effet sur ceux déjà retirés par le webhook
+    # Filet de sécurité : torrent ajouté entre-temps avec les mêmes fichiers
+    extra = find_and_delete_by_sizes(sizes, label=label, progress=qbit_progress, wait_cb=qbit_wait)
+    return len(set(found) | set(extra))
+
+
+def run_webhook(handler_func, payload, path):
+    try:
+        handler_func(payload)
+    except Exception:
+        log.exception(f"Erreur traitement webhook {path}")
+
+
 # ── Serveur HTTP ─────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -983,6 +1438,10 @@ class Handler(BaseHTTPRequestHandler):
             if not check_auth(self):
                 return
             self._handle_delete_by_hash()
+        elif self.path.startswith("/job"):
+            if not check_auth(self):
+                return
+            self._handle_job()
         elif self.path.startswith("/config"):
             if not check_auth(self):
                 return
@@ -991,110 +1450,42 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _send_json(self, code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_delete_by_hash(self):
-        """Appelé par le menu contextuel qBittorrent (userscript). Action
-        immédiate et explicite (clic utilisateur) : pas de délai de grâce ni
-        de vérification disque nécessaires, contrairement au polling —
-        l'intention de l'utilisateur est déjà sans ambiguïté.
-
-        Essaie d'abord un match Radarr (film, un seul fichier suffit).
-        Si aucun film ne correspond, essaie Sonarr : traite TOUS les
-        fichiers du torrent (pas juste le premier trouvé), pour couvrir
-        un pack de saison complet en un seul clic.
-
-        Réponse toujours en JSON — {"ok": true/false, ...} — pour que le
-        script côté navigateur puisse construire son propre message
-        (titre, cibles réellement nettoyées) sans avoir à parser du texte
-        libre destiné aux logs."""
-        qs = urllib.parse.urlparse(self.path).query
-        params = urllib.parse.parse_qs(qs)
-        torrent_hash = (params.get("hash") or [""])[0].strip()
-
-        def respond(code, payload):
-            log.info(f"/delete-by-hash ({torrent_hash[:8]}) : {payload}")
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        """Appelé par le menu contextuel qBittorrent (userscript).
+        ?async=1 : répond tout de suite {"ok": true, "job_id": …}, progression
+        à suivre sur /job?id=…. Sinon : attend la fin et renvoie le résultat
+        final (JSON {"ok": true/false, ...}), comme avant."""
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        torrent_hash = (params.get("hash") or [""])[0].strip().lower()
+        async_mode = (params.get("async") or ["0"])[0] == "1"
 
         if not torrent_hash:
-            respond(400, {"ok": False, "error": "Paramètre 'hash' manquant"})
-            return
-        if not RADARR_INSTANCES and not SONARR_INSTANCES:
-            respond(500, {"ok": False, "error": "Ni RADARR_INSTANCES ni SONARR_INSTANCES ne sont configurés côté nettoyarr"})
+            self._send_json(400, {"ok": False, "error": "Paramètre 'hash' manquant"})
             return
 
-        try:
-            files = qb.get_files(torrent_hash)
-        except Exception as e:
-            respond(500, {"ok": False, "error": f"Torrent introuvable dans qBittorrent : {e}"})
+        job = create_delete_job(torrent_hash)
+        if async_mode:
+            self._send_json(202, {"ok": True, "job_id": job.id})
             return
+        job.done_event.wait()
+        self._send_json(job.http_status, job.result)
 
-        sizes = [f.get("size") for f in files if f.get("size")]
-
-        # 1) Tentative film (Radarr) — un seul fichier suffit à identifier le film
-        if RADARR_INSTANCES:
-            for size in sizes:
-                found = find_movie_by_file_size(size)
-                if found:
-                    instance, movie = found
-                    title = movie.get("title", "?")
-                    radarr_delete_movie(instance, movie["id"])
-                    # Seerr est nettoyé de façon asynchrone via le webhook
-                    # "On Movie Delete" déclenché par Radarr suite à cette
-                    # suppression (voir handle_item_delete) — donc bien réel,
-                    # même si pas fait directement dans cette requête.
-                    respond(200, {
-                        "ok": True,
-                        "kind": "movie",
-                        "title": title,
-                        "targets": ["Radarr", "qBittorrent", "NAS", "Seerr"],
-                    })
-                    return
-
-        # 2) Tentative série (Sonarr) — traite TOUS les fichiers du torrent,
-        #    pas seulement le premier, pour couvrir un pack de saison entier
-        if SONARR_INSTANCES:
-            index = sonarr_build_file_index()
-            matches = [index[s] for s in sizes if s in index]
-
-            if matches:
-                touched_seasons = set()  # (instance_url, series_id, season_number)
-                deleted_titles = []
-
-                for instance, series, episode, ep_file in matches:
-                    sonarr_delete_episode_file(instance, ep_file["id"])
-                    sonarr_set_episodes_monitored(instance, [episode["id"]], False)
-                    touched_seasons.add((instance["url"], series["id"], ep_file.get("seasonNumber"), series.get("title", "?")))
-
-                    season_num = ep_file.get("seasonNumber")
-                    ep_num = episode.get("episodeNumber")
-                    if isinstance(season_num, int) and isinstance(ep_num, int):
-                        deleted_titles.append(f"{series.get('title','?')} S{season_num:02d}E{ep_num:02d}")
-                    else:
-                        deleted_titles.append(series.get("title", "?"))
-
-                instances_by_url = {i["url"]: i for i in SONARR_INSTANCES}
-                for url, series_id, season_number, series_title in touched_seasons:
-                    sonarr_maybe_unmonitor_season(instances_by_url[url], series_id, season_number, series_title)
-
-                summary = ", ".join(deleted_titles[:5]) + (f" (+{len(deleted_titles) - 5} autres)" if len(deleted_titles) > 5 else "")
-                # Seerr n'est volontairement PAS nettoyé ici : supprimer un ou
-                # plusieurs épisodes ne veut pas dire "je ne veux plus la
-                # série" (voir docstring en tête de fichier).
-                respond(200, {
-                    "ok": True,
-                    "kind": "episodes",
-                    "count": len(matches),
-                    "summary": summary,
-                    "targets": ["Sonarr", "qBittorrent", "NAS"],
-                })
-                return
-
-        respond(404, {"ok": False, "error": "Aucun film ou épisode Radarr/Sonarr ne correspond à ce torrent"})
+    def _handle_job(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        job = JOBS.get((params.get("id") or [""])[0])
+        if not job:
+            self._send_json(404, {"ok": False, "error": "Job inconnu (expiré, ou conteneur redémarré entre-temps)"})
+            return
+        self._send_json(200, job.to_dict())
 
     def _handle_config_get(self):
         qs = urllib.parse.urlparse(self.path).query
@@ -1196,26 +1587,28 @@ class Handler(BaseHTTPRequestHandler):
 
         log.debug(f"Payload reçu sur {self.path} : {json.dumps(payload)[:2000]}")
 
-        try:
-            if self.path.startswith("/file-delete"):
-                handle_file_delete(payload)
-            elif self.path.startswith("/item-delete"):
-                handle_item_delete(payload)
-            else:
-                self.send_response(404)
-                self.end_headers()
-                return
-            self.send_response(200)
+        if self.path.startswith("/file-delete"):
+            handler_func = handle_file_delete
+        elif self.path.startswith("/item-delete"):
+            handler_func = handle_item_delete
+        else:
+            self.send_response(404)
             self.end_headers()
-        except Exception as e:
-            log.error(f"Erreur traitement webhook : {e}")
-            self.send_response(500)
-            self.end_headers()
+            return
+
+        # Réponse IMMÉDIATE, traitement en arrière-plan : Radarr/Sonarr
+        # attendent la réponse du webhook, et un traitement long (scan qBit)
+        # les bloquait — un pack de saison supprimé épisode par épisode
+        # prenait alors ~40 s par épisode.
+        self.send_response(200)
+        self.end_headers()
+        threading.Thread(target=run_webhook, args=(handler_func, payload, self.path), daemon=True).start()
 
 
 if __name__ == "__main__":
     apply_config(load_config())
     log.info(f"Démarrage — DRY_RUN={DRY_RUN}")
+    threading.Thread(target=qbit_cache_warmup, daemon=True).start()
 
     if QBIT_POLL_ENABLED:
         if not RADARR_INSTANCES:
@@ -1225,5 +1618,5 @@ if __name__ == "__main__":
         log.info("Poll qBit désactivé (QBIT_POLL_ENABLED=false)")
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
-    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /config, /delete-by-hash, /file-delete, /item-delete)")
+    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /config, /delete-by-hash, /job, /file-delete, /item-delete)")
     server.serve_forever()

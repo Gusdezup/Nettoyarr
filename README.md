@@ -34,7 +34,11 @@ Nettoyarr fait ce ménage automatiquement, dans les deux sens :
   taille de fichier exacte, pas par taille totale de torrent)
 - Nettoyage automatique de l'entrée Seerr/Overseerr correspondante
 - Prise en charge de plusieurs instances Radarr/Sonarr en parallèle
-- Sélection multiple de torrents dans le menu qBittorrent
+- Sélection multiple de torrents dans le menu qBittorrent, avec suivi de
+  progression en temps réel (étape en cours, barre, chrono)
+- Identification rapide depuis qBittorrent : historique Radarr/Sonarr
+  (`downloadId`), puis analyse du nom de release (`/api/v3/parse`), le
+  parcours complet de la bibliothèque n'étant qu'un dernier recours
 - Interface de configuration web (`/config`), éditable à chaud sans
   toucher au `docker-compose.yml` ni redémarrer le conteneur
 - Mode `DRY_RUN` pour tester sans rien supprimer réellement
@@ -77,7 +81,7 @@ avec boutons pour en ajouter/retirer).
 
 ## Authentification
 
-Par défaut, `/config`, `/delete-by-hash`, `/file-delete` et `/item-delete`
+Par défaut, `/config`, `/delete-by-hash`, `/job`, `/file-delete` et `/item-delete`
 sont accessibles **sans authentification** à quiconque atteint le port
 `9999` (`/health` reste toujours ouvert, healthcheck sans donnée
 sensible). Un bandeau d'avertissement s'affiche sur `/config` tant que
@@ -152,9 +156,16 @@ suivante) :
 |--------------------|----------------------------------------------------------------------|------|
 | `/file-delete`     | `On Movie File Delete` (Radarr) / `On Episode File Delete` (Sonarr)   | Remplacement de qualité (upgrade) : un seul fichier remplacé, l'item reste. |
 | `/item-delete`     | `On Movie Delete` (Radarr) / `On Series Delete` (Sonarr)              | Suppression complète : nettoyage qBittorrent **et** Seerr. |
-| `/delete-by-hash`  | Menu contextuel qBittorrent (userscript)                              | Suppression déclenchée depuis qBittorrent, cascade vers Radarr/Sonarr. |
+| `/delete-by-hash`  | Menu contextuel qBittorrent (userscript)                              | Suppression déclenchée depuis qBittorrent, cascade vers Radarr/Sonarr. Avec `?async=1`, répond immédiatement un `job_id`. |
+| `/job`             | Userscript (suivi, toutes les secondes)                               | État d'un nettoyage en cours : étape, compteur, pourcentage, temps écoulé, résultat final. |
 | `/config`          | —                                                                      | Interface web de configuration. |
 | `/health`          | —                                                                      | Vérifie la connexion à qBittorrent (toujours ouvert, sans auth). |
+
+Les webhooks `/file-delete` et `/item-delete` répondent immédiatement à
+Radarr/Sonarr et font leur traitement en arrière-plan : un traitement long
+ne bloque plus jamais l'*arr. Les listes de fichiers des torrents qBit
+sont mises en cache (préchargé au démarrage) : un hash donné a toujours
+la même liste de fichiers, inutile de la redemander à chaque recherche.
 
 ### Pourquoi deux routes séparées pour les webhooks Radarr/Sonarr
 

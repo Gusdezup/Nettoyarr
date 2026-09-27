@@ -5,6 +5,25 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.3] - 2026-09-27
+
+### Added
+- Suivi de progression en temps réel depuis qBittorrent : `/delete-by-hash?async=1` lance le nettoyage en arrière-plan et renvoie un `job_id` ; nouvelle route `/job?id=…` (protégée par l'auth) qui expose l'étape en cours, le compteur, le pourcentage, le temps écoulé et le temps sans progression. Sans `async=1`, `/delete-by-hash` garde son comportement synchrone.
+- `nettoyarr-qbit-button.user.js` : popup de progression ouverte dès la confirmation — étape en cours, barre qui se remplit (ou défile quand l'étape n'a pas de compteur), chrono, `Torrent i/n` en sélection multiple, résultats ajoutés au fil de l'eau, durée totale à la fin. Avertissement après 60 s sans progression (sans annuler).
+- Identification ciblée depuis qBittorrent : historique Radarr/Sonarr (`/api/v3/history?downloadId=<hash>`), puis analyse du nom de release (`/api/v3/parse`), le parcours complet des bibliothèques n'étant plus qu'un dernier recours. Garde-fou inchangé : correspondance à l'octet près obligatoire sur tous les chemins.
+- Cache des listes de fichiers qBittorrent (immuables pour un hash donné), préchargé au démarrage en arrière-plan ; un seul scan à la fois, les autres recherches réutilisent le cache.
+- Résultat de `/delete-by-hash` : nombre de torrents qBit supprimés (`torrents`), et `kind: "gone"` pour un torrent déjà absent de qBittorrent (typiquement un doublon cross-seed nettoyé juste avant dans la même sélection).
+
+### Changed
+- `/delete-by-hash` supprime lui-même les torrents qBit correspondants (repérés avant la suppression côté Radarr/Sonarr, supprimés après), au lieu de dépendre uniquement du webhook de l'*arr.
+- Les nettoyages depuis qBittorrent sont exécutés un par un, côté serveur comme côté userscript (fin du `Promise.all`).
+
+### Fixed
+- Webhooks `/file-delete` et `/item-delete` traités en arrière-plan avec réponse immédiate : Sonarr restait bloqué pendant le scan qBit (~40 s par épisode sur un pack de saison, plusieurs minutes au total).
+- Scan qBit de plusieurs minutes à chaque épisode supprimé (un appel `torrents/files` par torrent, ~1300 appels) : remplacé par le cache.
+- Sélection multiple de doublons cross-seed d'une même saison : les requêtes parallèles se faisaient concurrence (404 parasite sur la seconde, réponse jamais reçue pour la première).
+- Popup du userscript qui pouvait rester sans réponse indéfiniment : timeouts explicites (lancement, suivi du job).
+
 ## [0.5.1] - 2026-08-27
 
 ### Added
