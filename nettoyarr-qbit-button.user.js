@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.5.3
+// @version      0.6.0
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // ⚠️ À PERSONNALISER : remplace TON_URL_QBITTORRENT (ci-dessous) par
 // l'adresse IP ou le nom d'hôte réel de ton serveur qBittorrent, sur les
@@ -108,7 +108,7 @@
 
       const body = document.createElement("div");
       body.textContent = message;
-      body.style.cssText = "font-size:16px;white-space:pre-line;line-height:1.5;margin-bottom:20px;overflow-wrap:anywhere;";
+      body.style.cssText = "font-size:16px;white-space:pre-line;line-height:1.5;margin-bottom:20px;overflow-wrap:anywhere;max-height:60vh;overflow-y:auto;";
 
       const close = (result) => {
         document.body.removeChild(overlay);
@@ -279,7 +279,11 @@
   // envoyé directement dans la requête — GM_xmlhttpRequest permet ça sans
   // déclencher la popup de login native du navigateur (contrairement à un
   // fetch() classique face à un 401).
-  function nettoyarrGet(path, { timeout = 30000 } = {}) {
+  function nettoyarrGet(path, opts = {}) {
+    return nettoyarrRequest("GET", path, opts);
+  }
+
+  function nettoyarrRequest(method, path, { timeout = 30000 } = {}) {
     const cfg = getConfig();
     const headers = {};
     if (cfg.authUser || cfg.authPass) {
@@ -287,7 +291,7 @@
     }
     return new Promise((resolve) => {
       GM_xmlhttpRequest({
-        method: "GET",
+        method,
         url: `${cfg.nettoyarrUrl}${path}`,
         headers,
         timeout,
@@ -339,9 +343,30 @@
 
       failures = 0;
       const job = r.data;
-      if (job.state === "done") return { status: 200, data: job.result, raw: "" };
+      if (job.state === "done") return { status: 200, data: job.result, raw: "", jobId };
       ui.setStep(job.step, job.current, job.total, job.idle);
     }
+  }
+
+  const formatSize = (b) => (b / 1024 ** 3).toFixed(2).replace(".", ",") + " Gio";
+
+  // Bilan des autres hardlinks (torrent orphelin) : ce qui retient encore
+  // l'espace disque une fois le torrent supprimé.
+  function formatLinks(links) {
+    if (!links) return "";
+    if (links.error) return `\n⚠️ Autres hardlinks non vérifiés : ${links.error}`;
+    const out = [];
+    if (links.freed) out.push("💾 aucun autre hardlink : espace disque libéré");
+    if (links.deletable && links.deletable.length) {
+      const total = links.deletable.reduce((a, l) => a + l.size, 0);
+      out.push(`🔗 ${links.deletable.length} autre(s) hardlink(s) hors qBittorrent (${formatSize(total)}) — suppression proposée à la fin`);
+    }
+    if (links.held && links.held.length) {
+      const names = [...new Set(links.held.map((l) => l.torrent))].join(", ");
+      out.push(`⚠️ espace retenu par un torrent conservé (chevauchement partiel) : ${names}`);
+    }
+    if (links.not_found) out.push(`⚠️ ${links.not_found} hardlink(s) introuvable(s) dans le dossier analysé`);
+    return out.length ? "\n" + out.join("\n") : "";
   }
 
   function formatResult(r, name) {
@@ -355,12 +380,52 @@
         const unit = d.count > 1 ? "épisodes supprimés" : "épisode supprimé";
         return `✅ ${d.summary} : ${d.count} ${unit} de ${d.targets.join(" / ")}${qbit}`;
       }
+      if (d.kind === "orphan") {
+        const dup = d.torrents > 1 ? ` (+${d.torrents - 1} doublon(s) cross-seed)` : "";
+        const kept = d.kept && d.kept.length ? `\n⚠️ Conservé (torrent plus large) : ${d.kept.join(", ")}` : "";
+        return `✅ ${d.title} : non géré par Radarr/Sonarr, supprimé de ${d.targets.join(" / ")}${dup}${kept}${formatLinks(d.links)}`;
+      }
       if (d.kind === "gone") {
         return `ℹ️ ${name} : ${d.message}`;
       }
     }
     const err = (d && d.error) || r.raw || `erreur HTTP ${r.status}`;
     return `❌ ${name} : ${err}`;
+  }
+
+  // Deuxième confirmation, explicite : les autres hardlinks des fichiers
+  // supprimés (hors qBittorrent) retiennent encore l'espace disque. Le
+  // serveur ne supprime que les chemins qu'il a lui-même relevés pour ce job.
+  async function confirmLinks(pending) {
+    const all = pending.flatMap((p) => p.links);
+    const total = all.reduce((a, l) => a + l.size, 0);
+    const shown = all.slice(0, 12).map((l) => `• ${l.path} (${formatSize(l.size)})`).join("\n");
+    const more = all.length > 12 ? `\n… +${all.length - 12} autre(s)` : "";
+    const ok = await nettoyarrConfirm(
+      `Ces fichiers sont d'autres hardlinks des fichiers supprimés, hors qBittorrent — ` +
+      `tant qu'ils existent, l'espace disque n'est pas libéré :\n\n${shown}${more}\n\n` +
+      `Les supprimer aussi (${all.length} fichier(s), ${formatSize(total)}) ?`
+    );
+    if (!ok) return;
+
+    const lines = [];
+    for (const p of pending) {
+      const r = await nettoyarrRequest("POST", `/delete-links?job=${encodeURIComponent(p.jobId)}`);
+      const d = r.data;
+      if (!d) {
+        lines.push(`❌ ${p.name} : ${r.raw || "erreur HTTP " + r.status}`);
+        continue;
+      }
+      if (d.error) {
+        lines.push(`❌ ${p.name} : ${d.error}`);
+        continue;
+      }
+      const dry = d.dry_run ? " [DRY-RUN]" : "";
+      const freed = d.freed ? `, ${formatSize(d.freed)} libérés` : "";
+      lines.push(`${d.errors.length ? "⚠️" : "✅"} ${p.name} : ${d.deleted.length} hardlink(s) supprimé(s)${freed}${dry}`);
+      for (const err of d.errors) lines.push(`   ${err}`);
+    }
+    await nettoyarrAlert(lines.join("\n"));
   }
 
   async function onNettoyarrClick(e) {
@@ -399,6 +464,7 @@
     // saison (doublons cross-seed) ne se font plus concurrence, et le second
     // est simplement signalé comme déjà nettoyé.
     const ui = createProgressModal(hashes.length);
+    const pendingLinks = []; // hardlinks restants, supprimés seulement après confirmation
     for (let i = 0; i < hashes.length; i++) {
       const hash = hashes[i];
       const name = names[hash] || hash.slice(0, 8);
@@ -406,8 +472,13 @@
       ui.setStep("Démarrage…");
       const result = await runDelete(hash, ui);
       ui.addResult(formatResult(result, name));
+      const links = result.data && result.data.links;
+      if (result.jobId && links && links.deletable && links.deletable.length) {
+        pendingLinks.push({ jobId: result.jobId, name, links: links.deletable });
+      }
     }
     await ui.finish();
+    if (pendingLinks.length) await confirmLinks(pendingLinks);
   }
 
   function injectMenuItem() {

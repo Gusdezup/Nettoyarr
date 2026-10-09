@@ -5,6 +5,33 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.6.0] - 2026-10-09
+
+### Added
+- **Explorateur** (`/explorer`, désormais page d'accueil : `/` y redirige) : aide au choix des suppressions. Un inventaire regroupe les torrents qBittorrent en **releases** (torrents qui partagent au moins un fichier ≥ 50 Mo à l'octet près : copies cross-seed, un torrent par tracker, plus un éventuel pack qui les contient) et les relie à Radarr/Sonarr (titre, date d'import), à Tautulli (dernier visionnage, bibliothèque Plex) et à leurs trackers avec leurs seeders. Inventaire calculé en arrière-plan avec progression (`POST /inventory/refresh`, état sur `/inventory`), puis filtré côté navigateur : changer un critère est instantané. Tableau triable, sélection multiple, suppression par lot via `/delete-by-hash` (même chemin que le bouton qBittorrent), bilan des hardlinks et récapitulatif final. Bandeau visible quand `DRY_RUN` est actif.
+- **Règles de sélection cumulables** dans l'explorateur : chaque ligne associe un critère, un opérateur et une valeur, combinées par « toutes » (ET) ou « au moins une » (OU), avec des sous-groupes ayant leur propre logique (un niveau). Critères : texte partout, titre, nom des torrents (contient / ne contient pas), tracker (en seed sur / pas en seed sur / seulement sur), catégorie qBittorrent, instance *arr, type, bibliothèque Plex, dossier (est / n'est pas), taille, seeders sur tous les trackers ou sur au moins un, nombre de trackers (supérieur / inférieur), date d'import et dernier visionnage (avant / après, jamais vu, absent de Plex). Une règle sans valeur est ignorée. Les règles sont enregistrées côté serveur (`data/explorer.json`, `GET`/`POST /explorer/criteria`) et reprises sur tout appareil.
+- **Revalidation avant suppression** : au clic sur « Supprimer », l'inventaire est reconstruit et les règles réévaluées sur chaque release cochée. Une release qui ne les respecte plus (ex. copie ajoutée par cross-seed sur un tracker exclu depuis le dernier inventaire) ou qui a disparu est retirée de la sélection, avec une seconde confirmation listant les retraits. Si l'actualisation échoue, rien n'est supprimé.
+- **Noms des trackers** : nom de l'indexeur Prowlarr (nouveaux réglages `PROWLARR_URL`/`PROWLARR_API_KEY`, rapprochement de l'adresse d'announce avec les URL de l'indexeur par hôte, domaine puis nom de domaine), sinon nom déduit du domaine, et renommage manuel prioritaire depuis `/config` (`TRACKER_NAMES`). Les adresses d'un même tracker sont regroupées et traitées comme un seul tracker. Les règles restent liées à l'adresse : renommer n'en casse aucune.
+- **Tautulli** (`TAUTULLI_URL`/`TAUTULLI_API_KEY`, optionnel) : dernier visionnage par film/épisode et bibliothèque Plex. Historique relié par `rating_key`, ou par titre quand une bibliothèque Plex a été recréée.
+- **Torrents orphelins** (gérés par aucun Radarr/Sonarr, ex. copie cross-seed isolée) : `/delete-by-hash` les supprime désormais dans qBittorrent et sur le NAS au lieu de répondre 404 sans rien faire (`kind: "orphan"`). Un autre torrent n'est supprimé comme doublon que si tous ses fichiers ≥ 50 Mo sont inclus dans le torrent sélectionné ; un torrent plus large est conservé et signalé.
+- **Bilan des autres hardlinks** après toute suppression depuis qBittorrent ou l'explorateur (film, épisodes ou orphelin) : inode relevé avant suppression avec un descripteur ouvert, nombre de liens réellement restants relu après. Les liens restants sont retrouvés via un **index** des fichiers ≥ 50 Mo de `LINKS_SCAN_ROOT` (nouveau réglage, défaut `/media`) : sauvegardé dans `data/links-index.json.gz` et disponible dès le démarrage, mis à jour toutes les heures en ne relisant que les dossiers modifiés, reconstruit en entier une fois par semaine. Chaque chemin est revérifié ; un lien absent de l'index est signalé comme non localisé, sans parcours du disque. Les liens utilisés par aucun torrent restant sont proposés à la suppression.
+- Route `POST /delete-links?job=…` (protégée par l'auth) : supprime, après confirmation, uniquement les hardlinks relevés côté serveur pour ce job, à usage unique, avec revérification de l'inode. Respecte `DRY_RUN`.
+- `/delete-by-hash?links=0` : suppression sans bilan des hardlinks.
+- `/config` : sections Tautulli, Prowlarr et « Noms des trackers » (une ligne par tracker, adresses lues directement dans qBittorrent, nom Prowlarr ou automatique affiché par défaut), lien vers l'explorateur.
+- `nettoyarr-qbit-button.user.js` : bilan des hardlinks dans le résultat (espace libéré, liens restants, espace retenu par un torrent conservé) et seconde confirmation listant les fichiers à supprimer avec leur taille.
+
+### Changed
+- Recherche depuis qBittorrent : une erreur d'interrogation d'un Radarr/Sonarr pendant le parcours complet est désormais remontée ; dans ce cas le fallback orphelin est refusé (503) plutôt que de conclure à « aucun match ».
+- Index des hardlinks limité au système de fichiers de `LINKS_SCAN_ROOT`, dossiers `#snapshot`, `#recycle` et `@eaDir` ignorés : les snapshots Synology visibles faisaient relire toute la bibliothèque une fois par snapshot, et la corbeille est laissée à l'utilisateur (espace récupéré à son vidage).
+- Popups du userscript : contenu défilant au-delà de 60 % de la hauteur d'écran.
+- `nettoyarr-qbit-button.user.js` : `@connect *` au lieu d'une adresse à éditer ; l'adresse de qBittorrent se déclare désormais dans les `@match` personnalisés de l'extension (Violentmonkey : onglet Configuration ; Tampermonkey : Correspondances de l'utilisateur), qui ne sont plus écrasés par le copier-coller d'une mise à jour.
+
+### Fixed
+- `/config` : un champ laissé vide dans une liste répétée (ex. clé API vide d'une instance Radarr/Sonarr) décalait toutes les valeurs suivantes d'une ligne à la sauvegarde. Les champs vides sont désormais conservés à leur place.
+
+### Docs
+- `README.md` : sections « Explorateur », « Torrents orphelins » et « Autres hardlinks », montage `/media` en écriture, variables `LINKS_SCAN_ROOT`, `TAUTULLI_*`, `PROWLARR_*`, `TRACKER_NAMES`, nouvelles routes, installation du userscript via les `@match` personnalisés.
+
 ## [0.5.3] - 2026-09-27
 
 ### Added

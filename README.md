@@ -4,7 +4,8 @@ Suppression synchronisée entre Radarr/Sonarr et qBittorrent : supprimer un
 film ou une série, dans un sens comme dans l'autre, cascade automatiquement
 partout — fichiers, torrents qBittorrent (y compris les doublons
 cross-seed), et entrée Seerr/Overseerr — sans ménage manuel dans trois
-interfaces différentes.
+interfaces différentes. Un explorateur aide en plus à choisir quoi
+supprimer, selon des règles combinables.
 
 ## Pourquoi
 
@@ -26,6 +27,10 @@ Nettoyarr fait ce ménage automatiquement, dans les deux sens :
   torrents dans qBittorrent (menu contextuel injecté par un userscript) →
   le film est supprimé de Radarr, ou l'épisode/la saison passe en
   `unmonitored` sur Sonarr.
+- **Explorateur** : une page web qui liste toutes les releases avec leurs
+  trackers, seeders, dates d'import et de dernier visionnage, pour choisir
+  quoi supprimer selon des règles (taille, trackers, visionnage…), puis
+  supprimer la sélection en un clic.
 
 ## Fonctionnalités
 
@@ -34,8 +39,15 @@ Nettoyarr fait ce ménage automatiquement, dans les deux sens :
   taille de fichier exacte, pas par taille totale de torrent)
 - Nettoyage automatique de l'entrée Seerr/Overseerr correspondante
 - Prise en charge de plusieurs instances Radarr/Sonarr en parallèle
+- Explorateur des releases avec règles de sélection cumulables (ET/OU,
+  groupes), noms des trackers repris de Prowlarr, dernier visionnage via
+  Tautulli, et revérification des règles juste avant toute suppression
 - Sélection multiple de torrents dans le menu qBittorrent, avec suivi de
   progression en temps réel (étape en cours, barre, chrono)
+- Torrents orphelins (gérés par aucun Radarr/Sonarr, ex. copie cross-seed
+  isolée) : supprimés quand même dans qBittorrent et sur le NAS
+- Bilan des autres hardlinks des fichiers supprimés, proposés à la
+  suppression après confirmation, pour libérer réellement l'espace disque
 - Identification rapide depuis qBittorrent : historique Radarr/Sonarr
   (`downloadId`), puis analyse du nom de release (`/api/v3/parse`), le
   parcours complet de la bibliothèque n'étant qu'un dernier recours
@@ -58,6 +70,7 @@ services:
       - DRY_RUN=true
     volumes:
       - ./data:/app/data
+      - /volume1/media:/media   # même chemin que dans le conteneur qBittorrent
     deploy:
       resources:
         limits:
@@ -71,17 +84,20 @@ version commentée avec toutes les variables optionnelles.
 un filet de sécurité pour le tout premier démarrage (avant que `/app/data`
 contienne une config), à repasser à `false` depuis `/config` une fois que
 tu as vérifié les logs. Le volume `./data` est, lui, indispensable : c'est
-là que vit la config persistée.
+là que vivent la config persistée, les règles de l'explorateur et l'index
+des hardlinks. Le montage des médias est nécessaire pour le bilan des
+hardlinks (voir plus bas).
 
 Après `docker-compose up -d`, tout le reste (qBittorrent, Seerr, TMDB,
-instances Radarr/Sonarr, authentification...) se configure sur
-`http://<ip-du-nas>:9999/config` — un formulaire web, pas de JSON à taper
-à la main pour les instances Radarr/Sonarr (champs URL + clé API séparés,
-avec boutons pour en ajouter/retirer).
+Tautulli, Prowlarr, instances Radarr/Sonarr, authentification...) se
+configure sur `http://<ip-du-nas>:9999/config` — un formulaire web, pas de
+JSON à taper à la main pour les instances Radarr/Sonarr (champs URL + clé
+API séparés, avec boutons pour en ajouter/retirer).
 
 ## Authentification
 
-Par défaut, `/config`, `/delete-by-hash`, `/job`, `/file-delete` et `/item-delete`
+Par défaut, toutes les routes sauf `/health` (`/explorer`, `/config`,
+`/delete-by-hash`, `/job`, `/delete-links`, `/file-delete`, `/item-delete`…)
 sont accessibles **sans authentification** à quiconque atteint le port
 `9999` (`/health` reste toujours ouvert, healthcheck sans donnée
 sensible). Un bandeau d'avertissement s'affiche sur `/config` tant que
@@ -99,6 +115,92 @@ identifiants à 3 endroits :
    "⚙️ Configurer Nettoyarr" de l'extension.
 3. Rien côté `/health` — cet endpoint reste volontairement ouvert.
 
+Le navigateur demande les identifiants à l'ouverture de l'explorateur ou de
+`/config`.
+
+## Explorateur
+
+`http://<ip-du-nas>:9999/` (ou `/explorer`) ouvre l'explorateur : une aide
+au choix des suppressions, pensée pour une bibliothèque qui seed beaucoup.
+
+### Releases
+
+Nettoyarr regroupe les torrents qBittorrent en **releases** : des torrents
+qui partagent au moins un fichier de 50 Mo ou plus, à l'octet près. Une
+release réunit donc toutes les copies cross-seed d'un même contenu (un
+torrent par tracker), plus un éventuel pack qui la contient. Pour chaque
+release, l'explorateur affiche :
+
+- le titre Radarr/Sonarr (ou le nom du torrent, sans *arr) et sa taille ;
+- chaque tracker avec son nombre de seeders ;
+- la date d'import (Radarr/Sonarr, ou d'ajout dans qBittorrent sans *arr) ;
+- la date du dernier visionnage et la bibliothèque Plex, si Tautulli est
+  configuré.
+
+L'inventaire est construit en arrière-plan (bouton « Actualiser
+l'inventaire », progression affichée), puis filtré dans le navigateur :
+changer un critère est instantané. Compter une dizaine de secondes pour
+une actualisation une fois le cache qBittorrent rempli, plusieurs minutes
+pour la toute première après un démarrage.
+
+### Règles
+
+Les critères se composent en règles : chaque ligne associe un critère, un
+opérateur et une valeur. En tête, « toutes » (ET) ou « au moins une » (OU).
+**+ Groupe** ajoute un sous-bloc avec sa propre logique, l'équivalent de
+parenthèses :
+
+```
+toutes :
+  Taille (Gio)        supérieur à     10
+  Tracker             pas en seed sur HD-Forever
+  [Groupe] au moins une :
+     Dernier visionnage   jamais vu
+     Dernier visionnage   avant le 01/01/2025
+```
+
+Critères disponibles : texte (partout, titre, nom des torrents), tracker
+(en seed sur / pas en seed sur / seulement sur), catégorie qBittorrent,
+instance *arr, type, bibliothèque Plex, dossier, taille, seeders (sur tous
+les trackers ou sur au moins un), nombre de trackers, date d'import,
+dernier visionnage (avant / après / jamais vu / absent de Plex).
+
+Une règle sans valeur est ignorée. Les règles sont enregistrées côté
+serveur (`data/explorer.json`) et reprises sur n'importe quel appareil.
+
+« Pas en seed sur » s'évalue sur **tous** les torrents de la release : une
+seule copie sur le tracker exclu suffit à protéger la release.
+
+### Noms des trackers
+
+Les trackers sont affichés par nom plutôt que par adresse d'announce :
+
+1. nom saisi à la main dans `/config` (section « Noms des trackers »),
+   prioritaire ;
+2. sinon, nom de l'indexeur **Prowlarr** dont une URL correspond à
+   l'adresse d'announce (hôte exact, puis domaine, puis nom de domaine
+   seul — `tracker.exemple.org` est reconnu pour un indexeur
+   `https://exemple.org/`) ;
+3. sinon, nom déduit du domaine.
+
+Les adresses qui reviennent au même tracker sont regroupées et traitées
+comme un seul tracker. Les règles restent liées à l'adresse : renommer un
+tracker n'en casse aucune.
+
+### Suppression
+
+Coche les releases, puis « Supprimer la sélection ». Juste avant de
+supprimer, Nettoyarr **reconstruit l'inventaire et réévalue les règles**
+sur chaque release cochée : une release qui ne les respecte plus (par
+exemple parce que cross-seed vient d'ajouter une copie sur un tracker
+exclu) ou qui a disparu est retirée de la sélection, et une seconde
+confirmation liste les retraits. Si l'actualisation échoue, rien n'est
+supprimé.
+
+La suppression passe ensuite par le même chemin que le bouton qBittorrent
+(`/delete-by-hash`), une release à la fois : Radarr/Sonarr, qBittorrent
+(toutes les copies), NAS, Seerr pour les films, puis bilan des hardlinks.
+
 ## Bouton qBittorrent (userscript)
 
 [`nettoyarr-qbit-button.user.js`](./nettoyarr-qbit-button.user.js) ajoute
@@ -114,16 +216,19 @@ de saison complets pris en charge).
 2. Ouvre `nettoyarr-qbit-button.user.js`, copie tout le contenu, crée un
    nouveau script dans l'extension et colle-le (ou utilise "Importer un
    fichier" si l'extension le propose).
-3. **Édite les 2 lignes suivantes** en tête du script, avec l'adresse
-   réelle de ton qBittorrent :
-   ```
-   // @match        http://TON_URL_QBITTORRENT:8081/*
-   // @connect      TON_URL_QBITTORRENT
-   ```
-   Ces deux lignes sont des métadonnées lues par l'extension **avant même
-   l'exécution du script** (elles décident sur quelle page l'injecter) —
-   c'est la seule chose à éditer directement dans le code, et ça ne
-   change quasiment jamais une fois réglé.
+3. **Déclare l'adresse de ton qBittorrent dans les réglages du script**,
+   pas dans le code : ces réglages survivent aux mises à jour, alors qu'une
+   ligne `@match` éditée à la main est écrasée à chaque copier-coller d'une
+   nouvelle version.
+   - **Violentmonkey** : éditeur du script → onglet **Configuration** →
+     ajoute `http://<ip-qbittorrent>:8081/*` dans les `@match`
+     personnalisés et décoche la conservation des `@match` d'origine.
+   - **Tampermonkey** : éditeur du script → onglet **Paramètres** →
+     **Correspondances de l'utilisateur**, et décoche « Correspondances
+     d'origine ».
+
+   `@connect *` n'a pas à être modifié. Tampermonkey demande une seule fois
+   l'autorisation de joindre ton Nettoyarr, Violentmonkey ne l'utilise pas.
 4. Sauvegarde, recharge la page qBittorrent WebUI.
 
 ### Configuration (URL Nettoyarr et identifiants)
@@ -152,14 +257,18 @@ Le conteneur écoute sur le port `9999` et expose les routes suivantes
 (configuration des webhooks Radarr/Sonarr détaillée dans la section
 suivante) :
 
-| Route             | Déclenché par                                                      | Rôle |
-|--------------------|----------------------------------------------------------------------|------|
-| `/file-delete`     | `On Movie File Delete` (Radarr) / `On Episode File Delete` (Sonarr)   | Remplacement de qualité (upgrade) : un seul fichier remplacé, l'item reste. |
-| `/item-delete`     | `On Movie Delete` (Radarr) / `On Series Delete` (Sonarr)              | Suppression complète : nettoyage qBittorrent **et** Seerr. |
-| `/delete-by-hash`  | Menu contextuel qBittorrent (userscript)                              | Suppression déclenchée depuis qBittorrent, cascade vers Radarr/Sonarr. Avec `?async=1`, répond immédiatement un `job_id`. |
-| `/job`             | Userscript (suivi, toutes les secondes)                               | État d'un nettoyage en cours : étape, compteur, pourcentage, temps écoulé, résultat final. |
-| `/config`          | —                                                                      | Interface web de configuration. |
-| `/health`          | —                                                                      | Vérifie la connexion à qBittorrent (toujours ouvert, sans auth). |
+| Route                  | Déclenché par                                                      | Rôle |
+|-------------------------|----------------------------------------------------------------------|------|
+| `/file-delete`          | `On Movie File Delete` (Radarr) / `On Episode File Delete` (Sonarr)   | Remplacement de qualité (upgrade) : un seul fichier remplacé, l'item reste. |
+| `/item-delete`          | `On Movie Delete` (Radarr) / `On Series Delete` (Sonarr)              | Suppression complète : nettoyage qBittorrent **et** Seerr. |
+| `/delete-by-hash`       | Menu contextuel qBittorrent (userscript), explorateur                 | Suppression d'un torrent et de sa release, cascade vers Radarr/Sonarr. Avec `?async=1`, répond immédiatement un `job_id` ; `?links=0` saute le bilan des hardlinks. |
+| `/job`                  | Userscript, explorateur (suivi, toutes les secondes)                  | État d'un nettoyage ou d'un inventaire en cours : étape, compteur, pourcentage, temps écoulé, résultat final. |
+| `/delete-links`         | Userscript, explorateur (après confirmation manuelle)                 | Suppression des autres hardlinks des fichiers supprimés, relevés par le serveur pendant le job. |
+| `/explorer`             | Navigateur (`/` y redirige)                                            | Explorateur des releases. |
+| `/inventory`            | Explorateur                                                            | Inventaire des releases (`GET`), reconstruction en arrière-plan (`POST /inventory/refresh`). |
+| `/explorer/criteria`    | Explorateur                                                            | Lecture/enregistrement des règles de sélection. |
+| `/config`               | —                                                                      | Interface web de configuration. |
+| `/health`               | —                                                                      | Vérifie la connexion à qBittorrent (toujours ouvert, sans auth). |
 
 Les webhooks `/file-delete` et `/item-delete` répondent immédiatement à
 Radarr/Sonarr et font leur traitement en arrière-plan : un traitement long
@@ -185,6 +294,65 @@ chaque fichier de chaque torrent qBittorrent. Un hardlink garantit une
 taille identique à l'octet près, peu importe le reste du contenu du
 torrent — ça permet de retrouver et supprimer tous les doublons
 cross-seedés d'un coup.
+
+### Torrents orphelins
+
+Si ni Radarr ni Sonarr ne connaissent un torrent (copie cross-seed isolée
+dont l'original a été supprimé à la main, téléchargement manuel…), le
+bouton qBittorrent et l'explorateur le suppriment quand même dans
+qBittorrent et sur le NAS, avec ses doublons cross-seed. Garde-fous :
+
+- si un Radarr/Sonarr n'a pas pu être interrogé, **rien n'est supprimé**
+  (un « aucun match » ne voudrait alors rien dire) ;
+- un autre torrent n'est supprimé comme doublon que si **tous** ses gros
+  fichiers (≥ 50 Mo) sont inclus dans le torrent sélectionné : un torrent
+  plus large (ex. une intégrale contenant la saison sélectionnée) est
+  conservé et signalé.
+
+### Autres hardlinks (espace disque)
+
+Supprimer un hardlink ne libère aucun espace tant que d'autres liens vers
+le même fichier existent (copie d'origine restée dans `downloads/` après un
+retrait sans les fichiers, corbeille Radarr…). Depuis le bouton qBittorrent
+ou l'explorateur, pour **toutes** les suppressions (film, épisodes ou
+orphelin), Nettoyarr fait donc le bilan des liens restants :
+
+1. avant suppression, il relève l'inode de chaque fichier et garde un
+   descripteur ouvert dessus ;
+2. après suppression (*arr + qBittorrent), il relit le nombre de liens
+   réellement restants : s'il est à zéro, l'espace est libéré, rien à
+   chercher ;
+3. sinon il les retrouve via un **index** des fichiers de 50 Mo ou plus de
+   `LINKS_SCAN_ROOT`, chaque chemin étant revérifié. L'index est sauvegardé
+   dans `data/links-index.json.gz` (disponible dès le démarrage), mis à
+   jour toutes les heures en ne relisant que les dossiers modifiés, et
+   reconstruit en entier une fois par semaine. Un lien absent de l'index
+   (corbeille Synology, lien créé depuis la dernière mise à jour) est
+   signalé comme non localisé, sans parcours du disque, et l'index est
+   rafraîchi pour la fois suivante ;
+4. les liens qui ne servent à aucun torrent restant sont listés dans une
+   **seconde confirmation**, et ne sont supprimés qu'après ton accord,
+   seulement s'il s'agit toujours du même fichier.
+
+L'index reste sur le volume de `LINKS_SCAN_ROOT` et ignore `#snapshot`,
+`#recycle` et `@eaDir` : ce qui est dans la corbeille Synology sera libéré à
+son vidage, Nettoyarr n'y touche pas. La toute première construction de
+l'index peut prendre plusieurs minutes ; tant qu'elle n'est pas terminée,
+les liens restants sont signalés comme non localisés.
+
+Pour ça, Nettoyarr doit voir les fichiers **au même chemin que
+qBittorrent**, en écriture :
+
+```yaml
+    volumes:
+      - ./data:/app/data
+      - /volume1/media:/media   # même montage que le conteneur qBittorrent
+```
+
+Sans ce montage, le torrent est quand même supprimé, mais la recherche des
+autres hardlinks est ignorée (signalé dans le résultat). Les webhooks
+Radarr/Sonarr (`/file-delete`, `/item-delete`) ne font pas ce bilan : il
+n'y a personne pour confirmer.
 
 ## Configuration des webhooks Radarr/Sonarr
 
@@ -241,22 +409,28 @@ premier démarrage** (avant que `/app/data/config.json` existe) —
 ensuite, `/config` fait autorité et ces lignes n'ont plus d'effet, même
 après un `docker-compose down && up -d`.
 
-| Variable        | Défaut                        | Description |
-|-----------------|--------------------------------|--------------|
-| `DRY_RUN`       | `true`                          | Ne supprime rien réellement, log seulement |
-| `QBIT_URL`      | `http://localhost:8081`        | URL de l'interface qBittorrent |
-| `QBIT_API_KEY`  | —                               | Clé API (Bearer, qBittorrent >= 5.2.0) — recommandé |
-| `QBIT_USER`     | —                               | Fallback : login classique par cookie de session |
-| `QBIT_PASS`     | —                               | Fallback : mot de passe |
-| `SEERR_URL`     | `http://seerr:5055`            | URL de l'instance Seerr/Overseerr |
-| `SEERR_API_KEY` | —                               | Clé API Seerr |
-| `TMDB_API_KEY`  | —                               | Requis uniquement pour la conversion tvdbId → tmdbId (Sonarr) |
-| `AUTH_USER`     | —                               | Identifiant HTTP Basic Auth — voir section Authentification |
-| `AUTH_PASS`     | —                               | Mot de passe HTTP Basic Auth |
-| `LOG_LEVEL`     | `INFO`                          | Passer à `DEBUG` pour voir les payloads webhook bruts |
+| Variable           | Défaut                     | Description |
+|--------------------|-----------------------------|--------------|
+| `DRY_RUN`          | `true`                       | Ne supprime rien réellement, log seulement |
+| `QBIT_URL`         | `http://localhost:8081`     | URL de l'interface qBittorrent |
+| `QBIT_API_KEY`     | —                            | Clé API (Bearer, qBittorrent >= 5.2.0) — recommandé |
+| `QBIT_USER`        | —                            | Fallback : login classique par cookie de session |
+| `QBIT_PASS`        | —                            | Fallback : mot de passe |
+| `SEERR_URL`        | `http://seerr:5055`         | URL de l'instance Seerr/Overseerr |
+| `SEERR_API_KEY`    | —                            | Clé API Seerr |
+| `TMDB_API_KEY`     | —                            | Requis uniquement pour la conversion tvdbId → tmdbId (Sonarr) |
+| `TAUTULLI_URL`     | —                            | Optionnel : dernier visionnage et bibliothèque Plex dans l'explorateur |
+| `TAUTULLI_API_KEY` | —                            | Clé API Tautulli |
+| `PROWLARR_URL`     | —                            | Optionnel : noms des trackers dans l'explorateur, d'après les indexeurs |
+| `PROWLARR_API_KEY` | —                            | Clé API Prowlarr |
+| `TRACKER_NAMES`    | `{}`                         | JSON `{"adresse d'announce": "nom"}`, seulement comme valeur de départ — préfère `/config` |
+| `AUTH_USER`        | —                            | Identifiant HTTP Basic Auth — voir section Authentification |
+| `AUTH_PASS`        | —                            | Mot de passe HTTP Basic Auth |
+| `LOG_LEVEL`        | `INFO`                       | Passer à `DEBUG` pour voir les payloads webhook bruts |
 | `RADARR_INSTANCES` | `[]`                         | JSON, seulement comme valeur de départ — préfère `/config` |
 | `SONARR_INSTANCES` | `[]`                         | Idem |
-| `LISTEN_PORT`   | `9999`                          | Port d'écoute du webhook listener |
+| `LINKS_SCAN_ROOT`  | `/media`                     | Dossier indexé pour retrouver les autres hardlinks des fichiers supprimés (monté au même chemin que dans qBittorrent) |
+| `LISTEN_PORT`      | `9999`                       | Port d'écoute du webhook listener |
 
 ## ⚠️ Avant de passer en prod
 

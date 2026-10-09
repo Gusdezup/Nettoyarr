@@ -20,13 +20,13 @@ services:
       #    RÉSEAU LOCAL ────────────────────────────────────────────────
       # - AUTH_USER=
       # - AUTH_PASS=
-      # ↑ Tant que les deux sont vides, /config, /delete-by-hash,
-      # /file-delete et /item-delete sont accessibles sans authentification
-      # à quiconque atteint ce port (/health reste toujours ouvert). Si tu
-      # les renseignes, pense à mettre à jour aussi : les champs
-      # Username/Password des webhooks Radarr/Sonarr (Settings > Connect),
-      # et les constantes AUTH_USER/AUTH_PASS dans
-      # nettoyarr-qbit-button.user.js.
+      # ↑ Tant que les deux sont vides, toutes les routes (explorateur,
+      # /config, /delete-by-hash, /file-delete, /item-delete…) sont
+      # accessibles sans authentification à quiconque atteint ce port
+      # (/health reste toujours ouvert). Si tu les renseignes, pense à
+      # mettre à jour aussi : les champs Username/Password des webhooks
+      # Radarr/Sonarr (Settings > Connect), et la config du userscript
+      # (menu « ⚙️ Configurer Nettoyarr » de l'extension).
 
       # ── TOUT LE RESTE EST OPTIONNEL ──────────────────────────────────
       # Ces variables ne servent QUE de valeurs de départ pour le tout
@@ -56,6 +56,19 @@ services:
       # ↑ Seulement si tu utilises Sonarr : convertit un tvdbId en tmdbId
       # pour retrouver l'entrée Seerr correspondante.
 
+      # - TAUTULLI_URL=http://localhost:8181
+      # - TAUTULLI_API_KEY=
+      # ↑ Explorateur : date du dernier visionnage et bibliothèque Plex.
+
+      # - PROWLARR_URL=http://localhost:9696
+      # - PROWLARR_API_KEY=
+      # ↑ Explorateur : noms des trackers repris des indexeurs Prowlarr
+      # (sinon nom déduit de l'adresse d'announce, renommable dans /config).
+
+      # - LINKS_SCAN_ROOT=/media
+      # ↑ Dossier indexé pour retrouver les autres hardlinks des fichiers
+      # supprimés. Doit correspondre au montage des médias ci-dessous.
+
       # - LOG_LEVEL=INFO
 
       # - QBIT_POLL_ENABLED=false
@@ -81,15 +94,19 @@ services:
       # Le code du conteneur, en lecture seule.
 
       - ./data:/app/data
-      # EN ÉCRITURE. C'est ici que vit config.json (config éditable depuis
-      # /config), persistant entre redémarrages/recréations du conteneur.
-      # Sans ce volume, toute modif faite via /config serait perdue au
-      # prochain redémarrage.
+      # EN ÉCRITURE. C'est ici que vivent config.json (config éditable
+      # depuis /config), explorer.json (règles de l'explorateur) et
+      # links-index.json.gz (index des hardlinks), persistants entre
+      # redémarrages/recréations du conteneur.
 
-      # ── OPTIONNEL ─────────────────────────────────────────────────────
-      # - /path/to/your/media:/media:ro
-      # Uniquement nécessaire si tu actives QBIT_POLL_ENABLED (vérifie que
-      # le fichier a bien disparu du disque avant de toucher à Radarr).
+      # ── RECOMMANDÉ ───────────────────────────────────────────────────
+      - /path/to/your/media:/media
+      # EN ÉCRITURE, et au MÊME CHEMIN que dans le conteneur qBittorrent :
+      # sinon les chemins remontés par qBittorrent ne correspondent à rien.
+      # Sert au bilan des autres hardlinks après une suppression (et à leur
+      # suppression, sur confirmation) et à la vérification du poll qBit.
+      # Sans ce montage, les suppressions fonctionnent quand même, sans ce
+      # bilan.
 
     deploy:
       resources:
