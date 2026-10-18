@@ -333,6 +333,10 @@ orphelin), Nettoyarr fait donc le bilan des liens restants :
 4. les liens qui ne servent à aucun torrent restant sont listés dans une
    **seconde confirmation**, et ne sont supprimés qu'après ton accord,
    seulement s'il s'agit toujours du même fichier.
+   Les fichiers annexes de la release (`.nfo`, images, sous-titres) présents
+   dans ces copies sont proposés avec eux — repérés par inode, jamais par
+   leur nom — et le dossier de la copie est supprimé s'il ne contient plus
+   rien d'autre.
 
 L'index reste sur le volume de `LINKS_SCAN_ROOT` et ignore `#snapshot`,
 `#recycle` et `@eaDir` : ce qui est dans la corbeille Synology sera libéré à

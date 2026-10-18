@@ -5,6 +5,17 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.6.1] - 2026-10-18
+
+### Fixed
+- **Hardlinks : fichiers annexes oubliés.** Quand une release supprimée avait une autre copie hardlinkée ailleurs sur le NAS, seuls les gros fichiers (≥ 50 Mo, ceux de l'index) de cette copie étaient proposés à la suppression : le `.nfo`, les images, les sous-titres et le dossier restaient sur place. Les petits fichiers du torrent sont désormais relevés aussi (inode et chemin relatif), puis recherchés **par inode** dans le dossier de la release de chaque copie retrouvée. Un fichier ajouté à côté par un autre outil n'est jamais proposé ; un fichier également utilisé par un torrent conservé n'est pas touché.
+- **Dossier de la copie supprimé une fois vide**, de bas en haut, jamais au-dessus du dossier de la release ni de `LINKS_SCAN_ROOT`. Un dossier qui ne contient plus que des métadonnées Synology (`@eaDir`) est considéré comme vide ; un dossier qui contient encore autre chose est conservé et signalé. Si la copie n'a pas la structure du torrent, ou pour un torrent sans dossier, seul le dossier du fichier est examiné, sans suppression de dossier.
+- `nettoyarr-qbit-button.user.js` : le fichier publié en 0.6.0 était une version antérieure (adresse à éditer dans `@connect`, bilan des hardlinks réservé aux orphelins). Il est remplacé par la bonne version : `@connect *`, `@match` personnalisés, bilan des hardlinks pour films, épisodes et orphelins.
+
+### Changed
+- `/delete-links` renvoie `dirs_removed` et `dirs_kept` ; les liens proposés portent `companion: true` pour les fichiers annexes.
+- Userscript et explorateur : fichiers annexes comptés à part dans le bilan, marqués « annexe » dans la confirmation, dossiers supprimés ou conservés indiqués dans le résultat.
+
 ## [0.6.0] - 2026-10-09
 
 ### Added

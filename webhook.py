@@ -74,6 +74,7 @@ import html
 import json
 import logging
 import os
+import shutil
 import stat
 import threading
 import time
@@ -1835,17 +1836,21 @@ def links_prepare(delete_hashes, kept_hashes, infos, sizes, known_files=None, ex
     extra_own : chemins côté *arr (fichier de la bibliothèque), exclus des
     résultats s'ils existent encore (DRY_RUN)."""
     known_files = known_files or {}
-    ctx = {"targets": {}, "own": {}, "held": {}, "missing": 0, "checked": 0}
+    # companions : petits fichiers des torrents supprimés (nfo, jpg, srt…),
+    # absents de l'index ; on ne les cherche que dans les copies de la release
+    # où un gros fichier a été retrouvé (voir _find_companions).
+    ctx = {"targets": {}, "companions": {}, "own": {}, "held": {}, "missing": 0, "checked": 0}
 
-    def add_own(path, st):
+    def add_own(path, st, bucket, rel):
         key = (st.st_dev, st.st_ino)
-        t = ctx["targets"].get(key)
+        t = ctx[bucket].get(key)
         if t is None:
             try:
                 fd = os.open(path, os.O_RDONLY)
             except OSError:
                 fd = None
-            t = ctx["targets"][key] = {"size": st.st_size, "nlink0": st.st_nlink, "fd": fd}
+            t = ctx[bucket][key] = {"size": st.st_size, "nlink0": st.st_nlink, "fd": fd, "rels": set()}
+        t["rels"].add(rel)
         ctx["own"][path] = key
 
     for h in delete_hashes:
@@ -1853,16 +1858,26 @@ def links_prepare(delete_hashes, kept_hashes, infos, sizes, known_files=None, ex
         if not info:
             continue
         files = known_files.get(h) or qb.get_files(h)
-        for path, size in _torrent_file_paths(info, files):
-            if size not in sizes:
+        for (path, size), f in zip(_torrent_file_paths(info, files), files):
+            # Chemin relatif dans le torrent (« Release/Release.mkv »), pour
+            # retrouver le dossier de la release dans une copie hardlinkée.
+            rel = tuple(p for p in os.path.normpath(f.get("name", "")).split(os.sep) if p)
+            if size in sizes:
+                bucket = "targets"
+                ctx["checked"] += 1
+            elif size is not None and size < ORPHAN_MIN_FILE_SIZE:
+                bucket = "companions"
+            else:
                 continue
-            ctx["checked"] += 1
             try:
                 st = os.stat(path)  # suit un éventuel symlink cross-seed jusqu'au vrai fichier
             except OSError:
-                ctx["missing"] += 1
+                if bucket == "targets":
+                    ctx["missing"] += 1
                 continue
-            add_own(path, st)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            add_own(path, st, bucket, rel)
     for p in extra_own:
         if not p:
             continue
@@ -1878,13 +1893,64 @@ def links_prepare(delete_hashes, kept_hashes, infos, sizes, known_files=None, ex
         if not info:
             continue
         for path, size in _torrent_file_paths(info, qb.get_files(h)):
-            if size in sizes:
+            if size in sizes or (size is not None and size < ORPHAN_MIN_FILE_SIZE):
                 ctx["held"][path] = info.get("name", h[:8])
     return ctx
 
 
+def _copy_root(path, rels, root):
+    """Dossier de la release dans une copie hardlinkée : si le chemin finit
+    par le chemin relatif du fichier dans le torrent (dossier racine du
+    torrent exclu, son nom peut différer), on remonte d'autant. Renvoie
+    (dossier, récursif). Structure différente, ou torrent sans dossier :
+    seul le dossier du fichier est examiné, sans récursion ni nettoyage des
+    dossiers vides. Jamais LINKS_SCAN_ROOT lui-même ni au-dessus."""
+    parts = path.split(os.sep)
+    root = os.path.normpath(root)
+    for rel in sorted(rels, key=len, reverse=True):
+        tail = list(rel[1:])
+        if len(rel) >= 2 and parts[-len(tail):] == tail:
+            d = os.sep.join(parts[:-len(tail)]) or os.sep
+            if os.path.commonpath([d, root]) == root and d != root:
+                return d, True
+    return os.path.dirname(path), False
+
+
+def _find_companions(ctx, copy_dirs):
+    """Petits fichiers (nfo, jpg, srt…) hardlinkés depuis le torrent supprimé
+    dans les copies de la release. Repérés par inode uniquement : un fichier
+    ajouté à côté par un autre outil (affiche, nfo généré…) n'est jamais
+    proposé."""
+    comps = ctx["companions"]
+    found = {key: set() for key in comps}
+    if not comps:
+        return found
+    for d, recursive in copy_dirs.items():
+        stack = [d]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if recursive and e.name not in SKIP_DIR_NAMES:
+                            stack.append(e.path)
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                        key = (st.st_dev, st.st_ino)
+                        if key in comps and e.path not in ctx["own"]:
+                            found[key].add(e.path)
+                except OSError:
+                    continue
+    return found
+
+
 def _links_close(ctx):
-    for t in ctx["targets"].values():
+    for t in list(ctx["targets"].values()) + list(ctx.get("companions", {}).values()):
         if t.get("fd") is not None:
             try:
                 os.close(t["fd"])
@@ -1935,7 +2001,7 @@ def _links_scan(ctx, step):
     own_alive = {}
     for p in alive:
         own_alive[ctx["own"][p]] = own_alive.get(ctx["own"][p], 0) + 1
-    for key, t in targets.items():
+    for key, t in list(targets.items()) + list(ctx["companions"].items()):
         nlink = os.fstat(t["fd"]).st_nlink if t["fd"] is not None else t["nlink0"]
         t["expected"] = max(0, nlink - own_alive.get(key, 0))
 
@@ -1958,8 +2024,9 @@ def _links_scan(ctx, step):
                 if p not in ctx["own"] and _is_link_of(p, key):
                     found[key].add(p)
 
-    deletable, held, pending = [], [], {"links": [], "expected": {}, "sizes": {}}
+    deletable, held, pending = [], [], {"links": [], "expected": {}, "sizes": {}, "dirs": []}
     not_found = 0
+    copy_dirs = {}  # dossier de la release dans une copie -> récursif
     for key, t in targets.items():
         k = f"{key[0]}:{key[1]}"
         pending["expected"][k], pending["sizes"][k] = t["expected"], t["size"]
@@ -1970,6 +2037,23 @@ def _links_scan(ctx, step):
             else:
                 deletable.append({"path": p, "size": t["size"]})
                 pending["links"].append({"path": p, "dev": key[0], "ino": key[1], "size": t["size"]})
+                d, rec = _copy_root(p, t["rels"], root)
+                copy_dirs[d] = copy_dirs.get(d, False) or rec
+
+    # Fichiers annexes de la release (nfo, jpg, srt…) dans ces mêmes copies :
+    # sans eux, la copie restait sur le NAS avec ses petits fichiers.
+    companions = 0
+    for key, paths in _find_companions(ctx, copy_dirs).items():
+        t = ctx["companions"][key]
+        k = f"{key[0]}:{key[1]}"
+        for p in sorted(paths):
+            if p in ctx["held"]:
+                continue  # aussi utilisé par un torrent conservé
+            pending["expected"][k], pending["sizes"][k] = t["expected"], t["size"]
+            deletable.append({"path": p, "size": t["size"], "companion": True})
+            pending["links"].append({"path": p, "dev": key[0], "ino": key[1], "size": t["size"]})
+            companions += 1
+    pending["dirs"] = sorted(d for d, rec in copy_dirs.items() if rec)
 
     if not_found and idx is not None:
         links_index_refresh_async()  # rattrape un éventuel lien récent pour les prochaines fois
@@ -1979,7 +2063,9 @@ def _links_scan(ctx, step):
         res["not_found"] = not_found
     if idx is None:
         res["index_pending"] = True
-    log.info(f"  Hardlinks restants : {len(deletable)} supprimable(s), {len(held)} retenu(s) par qBit"
+    log.info(f"  Hardlinks restants : {len(deletable) - companions} supprimable(s)"
+             + (f" (+{companions} fichier(s) annexe(s))" if companions else "")
+             + f", {len(held)} retenu(s) par qBit"
              + (f", {not_found} non localisé(s)" if not_found else "")
              + (" — index pas encore prêt" if idx is None else ""))
     return res
@@ -2082,7 +2168,47 @@ def delete_links(pending):
         k = f"{l['dev']}:{l['ino']}"
         count[k] = count.get(k, 0) + 1
     freed = sum(pending["sizes"][k] for k, n in count.items() if n >= pending["expected"].get(k, 1 << 60))
-    return {"ok": not errors, "deleted": deleted, "errors": errors, "freed": freed, "dry_run": DRY_RUN}
+    dirs_removed, dirs_kept = _remove_empty_dirs(pending.get("dirs") or [], deleted)
+    return {"ok": not errors, "deleted": deleted, "errors": errors, "freed": freed,
+            "dirs_removed": dirs_removed, "dirs_kept": dirs_kept, "dry_run": DRY_RUN}
+
+
+def _remove_empty_dirs(roots, deleted):
+    """Après suppression des liens, supprime les dossiers de release devenus
+    vides (de bas en haut, dossier de la release compris, jamais au-dessus).
+    Un dossier qui contient encore autre chose que des métadonnées Synology
+    (@eaDir) est conservé et signalé. Seuls les dossiers où un fichier vient
+    d'être supprimé sont concernés."""
+    removed, kept = [], []
+    root = os.path.normpath(LINKS_SCAN_ROOT)
+    for d in roots:
+        if not any(os.path.commonpath([p, d]) == d for p in deleted):
+            continue
+        if os.path.commonpath([d, root]) != root or d == root or not os.path.isdir(d):
+            continue
+        if DRY_RUN:
+            log.info(f"[DRY-RUN] Suppression du dossier {d} s'il est vide")
+            continue
+        for cur, _subdirs, _files in os.walk(d, topdown=False):
+            if SKIP_DIR_NAMES & set(os.path.relpath(cur, d).split(os.sep)):
+                continue  # intérieur de @eaDir / #recycle : jamais parcouru
+            try:
+                rest = [n for n in os.listdir(cur) if n != "@eaDir"]
+                if rest:
+                    if cur == d:
+                        kept.append({"path": d, "left": sorted(rest)[:10]})
+                    continue
+                if os.path.isdir(os.path.join(cur, "@eaDir")):
+                    shutil.rmtree(os.path.join(cur, "@eaDir"))
+                os.rmdir(cur)
+                if cur == d:
+                    removed.append(d)
+                    log.info(f"  Dossier supprimé : {d}")
+            except OSError as e:
+                log.warning(f"  Dossier {cur} non supprimé : {e}")
+    for k in kept:
+        log.info(f"  Dossier conservé (contient encore : {', '.join(k['left'])}) : {k['path']}")
+    return removed, kept
 
 
 def qbit_cleanup_around(sizes, label, arr_action, step, qbit_progress, qbit_wait,
@@ -3208,7 +3334,10 @@ function formatLinks(l) {
   if (l.error) return `\n   ⚠️ autres hardlinks non vérifiés : ${l.error}`;
   if (l.freed) return "\n   💾 espace disque libéré";
   const out = [`\n   🔗 ${l.remaining} autre(s) lien(s) ailleurs sur le NAS`];
-  if (l.deletable && l.deletable.length) out.push(` (${l.deletable.length} supprimable(s), proposé à la fin)`);
+  if (l.deletable && l.deletable.length) {
+    const extras = l.deletable.filter((x) => x.companion).length;
+    out.push(` (${l.deletable.length - extras} supprimable(s)${extras ? ` + ${extras} fichier(s) annexe(s)` : ""}, proposé à la fin)`);
+  }
   if (l.not_found) out.push(`, ${l.not_found} non localisé(s) (corbeille Synology ?)`);
   return out.join("");
 }
@@ -3330,7 +3459,7 @@ async function deleteSelected() {
 async function confirmLinks(pending) {
   const all = pending.flatMap((p) => p.links);
   const total = all.reduce((a, l) => a + l.size, 0);
-  const shown = all.slice(0, 12).map((l) => `• ${l.path} (${fmtSize(l.size)})`).join("\n");
+  const shown = all.slice(0, 12).map((l) => `• ${l.path} (${l.companion ? "annexe" : fmtSize(l.size)})`).join("\n");
   const ok = await modal(
     "Ces fichiers sont d'autres hardlinks des fichiers supprimés, hors qBittorrent — " +
     `tant qu'ils existent, l'espace disque n'est pas libéré :\n\n${shown}` +
@@ -3344,8 +3473,10 @@ async function confirmLinks(pending) {
     const d = r.data;
     if (!d || d.error) { lines.push(`❌ ${p.name} : ${(d && d.error) || "HTTP " + r.status}`); continue; }
     const freed = d.freed ? `, ${fmtSize(d.freed)} libérés` : "";
-    lines.push(`${d.errors.length ? "⚠️" : "🔗"} ${p.name} : ${d.deleted.length} hardlink(s) supprimé(s)${freed}${d.dry_run ? " [DRY-RUN]" : ""}`);
+    lines.push(`${d.errors.length ? "⚠️" : "🔗"} ${p.name} : ${d.deleted.length} fichier(s) supprimé(s)${freed}${d.dry_run ? " [DRY-RUN]" : ""}`);
     for (const e of d.errors) lines.push(`   ${e}`);
+    for (const dir of d.dirs_removed || []) lines.push(`   🗑️ dossier supprimé : ${dir}`);
+    for (const k of d.dirs_kept || []) lines.push(`   📁 dossier conservé, contient encore : ${k.left.join(", ")} (${k.path})`);
   }
   return lines;
 }

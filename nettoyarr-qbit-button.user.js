@@ -1,20 +1,24 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.6.0
+// @version      0.6.1
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
-// ⚠️ À PERSONNALISER : remplace TON_URL_QBITTORRENT (ci-dessous) par
-// l'adresse IP ou le nom d'hôte réel de ton serveur qBittorrent, sur les
-// 2 lignes @match et @connect. L'URL de Nettoyarr et les identifiants
-// d'authentification (si activée) se règlent séparément, via le menu de
-// ce script dans Tampermonkey/Violentmonkey — voir plus bas dans le code.
+// ⚠️ NE PAS ÉDITER @match ICI : déclare l'adresse de ton qBittorrent dans les
+// réglages du script de l'extension, qui survivent aux mises à jour :
+// - Violentmonkey : éditeur du script → onglet « Configuration » → ajoute
+//   http://<ip-qbittorrent>:<port>/* dans les @match personnalisés, et
+//   décoche la conservation des @match d'origine.
+// - Tampermonkey : éditeur du script → onglet « Paramètres » → « Correspondances
+//   de l'utilisateur » (et décoche « Correspondances d'origine »).
+// L'URL de Nettoyarr et les identifiants d'authentification (si activée) se
+// règlent via le menu du script : « ⚙️ Configurer Nettoyarr (URL / auth) ».
 // @match        http://TON_URL_QBITTORRENT:8081/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// @connect      TON_URL_QBITTORRENT
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -350,23 +354,30 @@
 
   const formatSize = (b) => (b / 1024 ** 3).toFixed(2).replace(".", ",") + " Gio";
 
-  // Bilan des autres hardlinks (torrent orphelin) : ce qui retient encore
-  // l'espace disque une fois le torrent supprimé.
+  // Bilan des autres hardlinks : ce qui retient encore l'espace disque une
+  // fois le torrent supprimé (film, épisodes ou orphelin).
   function formatLinks(links) {
     if (!links) return "";
     if (links.error) return `\n⚠️ Autres hardlinks non vérifiés : ${links.error}`;
-    const out = [];
-    if (links.freed) out.push("💾 aucun autre hardlink : espace disque libéré");
+    const dry = links.dry_run ? " [DRY-RUN]" : "";
+    if (links.freed) return `\n💾 aucun autre lien vers ces fichiers : espace disque libéré${dry}`;
+    const out = [`🔗 ${links.remaining} autre(s) lien(s) vers ces fichiers ailleurs sur le NAS${dry}`];
     if (links.deletable && links.deletable.length) {
       const total = links.deletable.reduce((a, l) => a + l.size, 0);
-      out.push(`🔗 ${links.deletable.length} autre(s) hardlink(s) hors qBittorrent (${formatSize(total)}) — suppression proposée à la fin`);
+      const extras = links.deletable.filter((l) => l.companion).length;
+      const annex = extras ? ` + ${extras} fichier(s) annexe(s) (nfo, jpg…)` : "";
+      out.push(`   • ${links.deletable.length - extras} localisé(s) hors qBittorrent${annex} (${formatSize(total)}) — suppression proposée à la fin`);
     }
     if (links.held && links.held.length) {
       const names = [...new Set(links.held.map((l) => l.torrent))].join(", ");
-      out.push(`⚠️ espace retenu par un torrent conservé (chevauchement partiel) : ${names}`);
+      out.push(`   • retenu(s) par un torrent conservé (chevauchement partiel) : ${names}`);
     }
-    if (links.not_found) out.push(`⚠️ ${links.not_found} hardlink(s) introuvable(s) dans le dossier analysé`);
-    return out.length ? "\n" + out.join("\n") : "";
+    if (links.not_found) {
+      out.push(links.index_pending
+        ? `   • ${links.not_found} non localisé(s) : index des hardlinks pas encore prêt (redémarrage récent)`
+        : `   • ${links.not_found} non localisé(s) : probablement dans la corbeille Synology (#recycle, ignorée), libéré(s) à son vidage`);
+    }
+    return "\n" + out.join("\n");
   }
 
   function formatResult(r, name) {
@@ -374,11 +385,11 @@
     if (d && d.ok) {
       const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent${d.torrents > 1 ? "s" : ""} qBit)` : "";
       if (d.kind === "movie") {
-        return `✅ ${d.title} : supprimé de ${d.targets.join(" / ")}${qbit}`;
+        return `✅ ${d.title} : supprimé de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
       }
       if (d.kind === "episodes") {
         const unit = d.count > 1 ? "épisodes supprimés" : "épisode supprimé";
-        return `✅ ${d.summary} : ${d.count} ${unit} de ${d.targets.join(" / ")}${qbit}`;
+        return `✅ ${d.summary} : ${d.count} ${unit} de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
       }
       if (d.kind === "orphan") {
         const dup = d.torrents > 1 ? ` (+${d.torrents - 1} doublon(s) cross-seed)` : "";
@@ -399,7 +410,7 @@
   async function confirmLinks(pending) {
     const all = pending.flatMap((p) => p.links);
     const total = all.reduce((a, l) => a + l.size, 0);
-    const shown = all.slice(0, 12).map((l) => `• ${l.path} (${formatSize(l.size)})`).join("\n");
+    const shown = all.slice(0, 12).map((l) => `• ${l.path} (${l.companion ? "annexe" : formatSize(l.size)})`).join("\n");
     const more = all.length > 12 ? `\n… +${all.length - 12} autre(s)` : "";
     const ok = await nettoyarrConfirm(
       `Ces fichiers sont d'autres hardlinks des fichiers supprimés, hors qBittorrent — ` +
@@ -422,8 +433,10 @@
       }
       const dry = d.dry_run ? " [DRY-RUN]" : "";
       const freed = d.freed ? `, ${formatSize(d.freed)} libérés` : "";
-      lines.push(`${d.errors.length ? "⚠️" : "✅"} ${p.name} : ${d.deleted.length} hardlink(s) supprimé(s)${freed}${dry}`);
+      lines.push(`${d.errors.length ? "⚠️" : "✅"} ${p.name} : ${d.deleted.length} fichier(s) supprimé(s)${freed}${dry}`);
       for (const err of d.errors) lines.push(`   ${err}`);
+      for (const dir of d.dirs_removed || []) lines.push(`   🗑️ dossier supprimé : ${dir}`);
+      for (const k of d.dirs_kept || []) lines.push(`   📁 dossier conservé, contient encore : ${k.left.join(", ")} (${k.path})`);
     }
     await nettoyarrAlert(lines.join("\n"));
   }
