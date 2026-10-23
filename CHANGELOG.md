@@ -5,6 +5,11 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.6.2] - 2026-10-23
+
+### Security
+- **Image : paquets Alpine mis à jour au build** (`apk upgrade --no-cache`). Le magasin de certificats (`ca-certificates`) suit désormais les mises à jour de sécurité d'Alpine à chaque release, notamment le retrait des certificats eMudhra compromis (octobre 2026). Aucun changement de code ; Nettoyarr n'est pas concerné par les failles PHP et Node.js d'octobre 2026.
+
 ## [0.6.1] - 2026-10-18
 
 ### Fixed

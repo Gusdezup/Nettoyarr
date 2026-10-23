@@ -1,5 +1,7 @@
 FROM public.ecr.aws/docker/library/python:3-alpine
 
+RUN apk upgrade --no-cache
+
 WORKDIR /app
 COPY webhook.py .
 
