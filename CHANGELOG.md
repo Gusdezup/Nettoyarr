@@ -18,6 +18,7 @@ et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
 ### Changed
 - Logs : durée du relevé des liens restants et du bilan des hardlinks.
+- Image de base tirée de `mirror.gcr.io` (miroir Docker Hub de Google) : le miroir AWS ECR renvoyait des erreurs 429 au build.
 
 ## [0.6.2] - 2026-10-23
 

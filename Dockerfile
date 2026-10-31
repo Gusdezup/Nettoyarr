@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/python:3-alpine
+FROM mirror.gcr.io/library/python:3-alpine
 
 RUN apk upgrade --no-cache
 
