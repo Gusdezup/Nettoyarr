@@ -48,6 +48,10 @@ Nettoyarr fait ce ménage automatiquement, dans les deux sens :
   isolée) : supprimés quand même dans qBittorrent et sur le NAS
 - Bilan des autres hardlinks des fichiers supprimés, proposés à la
   suppression après confirmation, pour libérer réellement l'espace disque
+- Sauvegarde préalable optionnelle de la release sur un disque d'archive
+  (dock USB), avec mise à jour du listing du disque
+- File d'attente côté serveur : une sélection va à son terme même onglet
+  fermé, suivie (et annulable) depuis la page `/jobs`
 - Identification rapide depuis qBittorrent : historique Radarr/Sonarr
   (`downloadId`), puis analyse du nom de release (`/api/v3/parse`), le
   parcours complet de la bibliothèque n'étant qu'un dernier recours
@@ -203,6 +207,8 @@ supprimé.
 La suppression passe ensuite par le même chemin que le bouton qBittorrent
 (`/delete-by-hash`), une release à la fois : Radarr/Sonarr, qBittorrent
 (toutes les copies), NAS, Seerr pour les films, puis bilan des hardlinks.
+Si la [sauvegarde préalable](#sauvegarde-préalable-sur-disque-externe) est
+activée, la confirmation propose de sauvegarder d'abord la sélection.
 
 ## Bouton qBittorrent (userscript)
 
@@ -234,10 +240,19 @@ de saison complets pris en charge).
    l'autorisation de joindre ton Nettoyarr, Violentmonkey ne l'utilise pas.
 4. Sauvegarde, recharge la page qBittorrent WebUI.
 
-Pendant un traitement, le bouton **« Continuer en arrière-plan »** masque la
-popup pour rendre la main à qBittorrent : une pastille en bas à droite
-affiche l'étape en cours (clic pour rouvrir), et la popup réapparaît avec le
-résultat à la fin.
+Toute la sélection est confiée au serveur, qui la traite dans l'ordre :
+**tu peux fermer l'onglet**, tout ira à son terme. Pendant le traitement :
+
+- **« Annuler »** arrête vraiment : une copie de sauvegarde en cours est
+  interrompue (copie partielle effacée), les torrents en attente sont
+  abandonnés. Une suppression déjà commencée va à son terme.
+- **« Continuer dans une page séparée »** ferme la popup et ouvre la page
+  `/jobs` de Nettoyarr pour cette sélection : progression, questions,
+  annulation, hardlinks restants.
+
+Seule exception : si une question se pose pendant une sauvegarde (disque à
+identifier, disque plein…), la suite attend ta réponse, dans qBittorrent ou
+sur `/jobs`.
 
 ### Configuration (URL Nettoyarr et identifiants)
 
@@ -258,6 +273,69 @@ Si tu ne vois pas cette entrée de menu, vérifie que la version installée
 correspond bien au fichier du repo (`Ctrl+A` dans l'éditeur du script pour
 comparer), et recharge complètement l'onglet qBittorrent après toute mise
 à jour du script.
+
+## Sauvegarde préalable sur disque externe
+
+Optionnelle, désactivée par défaut (`/config` → « Sauvegarde préalable sur
+disque externe »). Une fois activée, la confirmation de suppression
+(userscript et explorateur) propose une case **« 💾 Sauvegarder d'abord »**,
+décochée.
+
+- La release (le contenu du torrent, sous son nom) est copiée **à la racine**
+  du disque d'archive branché, puis ajoutée à son **listing** :
+  `taille<TAB>nom`, comme une sortie de `du -h`.
+- Elle n'est supprimée qu'une fois la copie terminée, écrite sur le disque et
+  vérifiée (tailles). Une copie interrompue reste dans un dossier
+  `….nettoyarr-partiel`, effacé à la tentative suivante.
+- La copie est faite **même en `DRY_RUN`** : elle ne détruit rien.
+- Chaque disque est reconnu par un fichier **`.nettoyarr-disque`** à sa
+  racine, contenant son numéro. S'il manque, Nettoyarr demande le numéro (en
+  proposant le suivant libre) et crée le fichier.
+- Le listing du disque N est le premier fichier `disqueN….txt` du dossier
+  des listings (ex. `disque7_liste_films.txt`), ou `disqueN_liste.txt`
+  s'il n'existe pas encore.
+- **Déjà sauvegardée ?** Avant de proposer la sauvegarde, Nettoyarr cherche
+  chaque release dans tous les listings (`taille<TAB>nom`, nom de fichier
+  seul ou chemin `dossier/fichier` ; extension vidéo et casse ignorées). La
+  confirmation indique « déjà sauvegardé → disque N », et une release listée
+  n'est jamais recopiée : la suppression suit, sans brancher de disque.
+- Pas de disque branché, ou pas assez de place : Nettoyarr propose de
+  réessayer (après avoir branché un disque), de supprimer sans sauvegarde,
+  ou de ne pas supprimer.
+
+Nettoyarr refuse d'écrire sur la partition système d'un Synology
+(`/dev/md0`, où se trouve le dossier du dock quand aucun disque n'est
+branché), sur le disque des médias ou de `/app/data`, et sur un volume de
+moins de 32 Gio.
+
+### Montages
+
+Le dock et le dossier des listings se montent **au même chemin** dans le
+conteneur. Pour qu'un disque branché ou changé après le démarrage du
+conteneur soit vu, monte le **dossier parent** du dock avec `:rslave` :
+
+```yaml
+    volumes:
+      - /volumeUSB2:/volumeUSB2:rslave
+      - /volumeUSB1/usbshare/Liste_disques_archives:/volumeUSB1/usbshare/Liste_disques_archives
+```
+
+puis renseigne `BACKUP_PATHS` = `/volumeUSB2/usbshare` dans `/config`.
+
+Sur Synology, les montages sont privés par défaut et Docker refuse
+`:rslave` (« not a shared or slave mount »). Rends-les partagés une fois par
+démarrage, via le **Planificateur de tâches** de DSM (tâche déclenchée au
+démarrage, utilisateur root) :
+
+```bash
+mount --make-rshared /
+sleep 5
+docker start nettoyarr 2>/dev/null
+```
+
+Le `docker start` rattrape le cas où Docker aurait tenté de lancer
+Nettoyarr avant la tâche. Sans `:rslave`, ça fonctionne aussi, mais il faut
+redémarrer le conteneur après chaque branchement de disque.
 
 ## Architecture
 
@@ -448,6 +526,9 @@ après un `docker-compose down && up -d`.
 | `RADARR_INSTANCES` | `[]`                         | JSON, seulement comme valeur de départ — préfère `/config` |
 | `SONARR_INSTANCES` | `[]`                         | Idem |
 | `LINKS_SCAN_ROOT`  | `/media`                     | Dossier indexé pour retrouver les autres hardlinks des fichiers supprimés (monté au même chemin que dans qBittorrent) |
+| `BACKUP_ENABLED`   | `false`                      | Propose la sauvegarde préalable sur disque externe |
+| `BACKUP_PATHS`     | —                            | Emplacement(s) du dock, séparés par des virgules (ex. `/volumeUSB2/usbshare`) |
+| `BACKUP_LISTING_DIR` | —                          | Dossier des listings `disqueN….txt` |
 | `LISTEN_PORT`      | `9999`                       | Port d'écoute du webhook listener |
 
 ## ⚠️ Avant de passer en prod

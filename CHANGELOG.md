@@ -5,6 +5,25 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.8.0] - 2026-10-31
+
+### Added
+- **Sauvegarde préalable sur disque externe** (option de `/config`, désactivée par défaut). Une fois activée, la confirmation de suppression (userscript et explorateur) propose une case « 💾 Sauvegarder d'abord », décochée. La release est copiée à la racine d'un disque d'archive branché (dock USB), puis ajoutée à son listing (`taille<TAB>nom`, format `du -h`) ; elle n'est supprimée qu'une fois la copie terminée, écrite sur le disque (`fsync`) et vérifiée (tailles). La copie se fait dans un dossier `.nettoyarr-partiel`, renommé à la fin : une copie interrompue n'est jamais prise pour une sauvegarde. Elle est réelle même en `DRY_RUN`, puisqu'elle ne détruit rien.
+  - Chaque disque est reconnu par un fichier `.nettoyarr-disque` à sa racine, contenant son numéro ; s'il manque, Nettoyarr demande le numéro (en proposant le suivant libre) et crée le fichier.
+  - Listing : premier fichier `disqueN….txt` du dossier des listings (ex. `disque7_liste_films.txt`), créé sous le nom `disqueN_liste.txt` s'il n'existe pas. Une release déjà présente sur le disque (même nom, mêmes tailles) n'est pas recopiée.
+  - **Releases déjà sauvegardées** : avant de proposer la sauvegarde, Nettoyarr cherche chaque release dans tous les listings (`disqueN….txt`, quel que soit leur format : `taille<TAB>nom`, nom de fichier seul ou chemin `dossier/fichier`, extension vidéo et casse ignorées). La confirmation indique « déjà sauvegardé → disque N », et une release listée n'est jamais recopiée, même case cochée : la suppression suit directement, sans avoir besoin de brancher le disque.
+  - Aucun disque branché ou pas assez de place : le choix est proposé entre réessayer (après avoir branché un disque), supprimer sans sauvegarde, ou ne pas supprimer.
+  - Garde-fous : refus d'écrire sur la partition système Synology (`/dev/md0`, cas d'un emplacement du dock sans disque branché), sur le disque des médias ou de `/app/data`, ou sur un volume de moins de 32 Gio. Le cache de page est purgé au fil de la copie pour ne pas pénaliser Plex.
+  - Réglages : `BACKUP_ENABLED`, `BACKUP_PATHS` (un ou plusieurs emplacements du dock), `BACKUP_LISTING_DIR`. L'état du dock (disque n°, place libre, ou raison du refus) est affiché dans `/config`.
+- **Page `/jobs`** : suivi des suppressions en cours ou récentes (dernière heure), une carte par torrent avec étape, progression, résultat, sauvegarde ; réponse aux questions (disque à identifier, disque plein…), annulation, et suppression des hardlinks restants. `/jobs?batch=…` n'affiche qu'une sélection.
+- **Bouton « Annuler »** (userscript et `/jobs`) : il arrête vraiment. Une copie en cours est interrompue et sa copie partielle effacée, les torrents encore en attente sont abandonnés, rien n'est supprimé. Une suppression déjà commencée va à son terme (l'interrompre laisserait qBittorrent, les *arr et le NAS dans un état incohérent).
+- Endpoints : `POST /batch`, `GET /jobs.json`, `POST /job/answer`, `POST /job/cancel`, `GET /backup/status`, `POST /backup/identify` ; `/delete-by-hash` accepte `backup=1`, `name` et `batch`.
+
+### Changed
+- **Le serveur enchaîne seul la sélection** : les suppressions passent par une file d'attente unique, traitée dans l'ordre (sauvegarde puis suppression, torrent après torrent). Le userscript envoie toute la sélection d'un coup (`/batch`) ; fermer l'onglet qBittorrent n'interrompt plus rien. Seule une question en attente de réponse suspend la suite.
+- `nettoyarr-qbit-button.user.js` : « Continuer en arrière-plan » et sa pastille sont remplacés par **« Continuer dans une page séparée »**, qui ouvre `/jobs` pour la sélection en cours. Le userscript 0.8.0 nécessite Nettoyarr 0.8.0.
+- Explorateur : même case de sauvegarde à la confirmation ; les questions de sauvegarde s'y affichent en popup.
+
 ## [0.7.0] - 2026-10-31
 
 ### Added

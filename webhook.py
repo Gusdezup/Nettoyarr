@@ -73,7 +73,9 @@ import hmac
 import html
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import stat
 import threading
@@ -119,6 +121,7 @@ CONFIG_KEYS = [
     "TAUTULLI_URL", "TAUTULLI_API_KEY",
     "TRACKER_NAMES",
     "PROWLARR_URL", "PROWLARR_API_KEY",
+    "BACKUP_ENABLED", "BACKUP_PATHS", "BACKUP_LISTING_DIR",
 ]
 
 
@@ -148,6 +151,9 @@ def _config_from_env():
         "TRACKER_NAMES": json.loads(os.environ.get("TRACKER_NAMES", "{}")),
         "PROWLARR_URL": os.environ.get("PROWLARR_URL", ""),
         "PROWLARR_API_KEY": os.environ.get("PROWLARR_API_KEY", ""),
+        "BACKUP_ENABLED": os.environ.get("BACKUP_ENABLED", "false").lower() == "true",
+        "BACKUP_PATHS": [p.strip() for p in os.environ.get("BACKUP_PATHS", "").split(",") if p.strip()],
+        "BACKUP_LISTING_DIR": os.environ.get("BACKUP_LISTING_DIR", ""),
     }
 
 
@@ -200,6 +206,7 @@ def apply_config(cfg):
     global TAUTULLI_URL, TAUTULLI_API_KEY
     global TRACKER_NAMES
     global PROWLARR_URL, PROWLARR_API_KEY
+    global BACKUP_ENABLED, BACKUP_PATHS, BACKUP_LISTING_DIR
     global qb
 
     QBIT_URL = cfg["QBIT_URL"]
@@ -227,6 +234,12 @@ def apply_config(cfg):
     old_prowlarr = (globals().get("PROWLARR_URL"), globals().get("PROWLARR_API_KEY"))
     PROWLARR_URL = (cfg.get("PROWLARR_URL") or "").rstrip("/")
     PROWLARR_API_KEY = cfg.get("PROWLARR_API_KEY") or ""
+    BACKUP_ENABLED = bool(cfg.get("BACKUP_ENABLED"))
+    paths = cfg.get("BACKUP_PATHS") or []
+    if isinstance(paths, str):
+        paths = paths.replace(",", "\n").splitlines()
+    BACKUP_PATHS = [p.strip().rstrip("/") for p in paths if p.strip().rstrip("/")]
+    BACKUP_LISTING_DIR = (cfg.get("BACKUP_LISTING_DIR") or "").strip().rstrip("/")
     if old_prowlarr != (PROWLARR_URL, PROWLARR_API_KEY) and INVENTORY["data"]:
         # Prowlarr modifié depuis /config : seuls les noms des trackers sont
         # recalculés (quelques secondes), pas tout l'inventaire.
@@ -262,6 +275,8 @@ def current_config():
         "TAUTULLI_URL": TAUTULLI_URL, "TAUTULLI_API_KEY": TAUTULLI_API_KEY,
         "TRACKER_NAMES": TRACKER_NAMES,
         "PROWLARR_URL": PROWLARR_URL, "PROWLARR_API_KEY": PROWLARR_API_KEY,
+        "BACKUP_ENABLED": BACKUP_ENABLED, "BACKUP_PATHS": BACKUP_PATHS,
+        "BACKUP_LISTING_DIR": BACKUP_LISTING_DIR,
     }
 
 
@@ -1238,6 +1253,16 @@ def render_config_page(cfg, saved=False, error=""):
         "    <small>Aucun tracker trouvé : qBittorrent injoignable ? (voir les logs)</small>")
     sonarr_rows = render_instance_rows(cfg["SONARR_INSTANCES"], "SONARR")
 
+    backup_lines = []
+    for d in (backup_status()["disks"] if cfg.get("BACKUP_PATHS") else []):
+        if d["usable"]:
+            who = f"disque {d['disk']}" if d["disk"] else "disque non identifié (numéro demandé à la 1re sauvegarde)"
+            backup_lines.append(f"✅ <code>{esc(d['path'])}</code> : {who}, {esc(_du_size(d['free']))} libres "
+                                f"sur {esc(_du_size(d['total']))}")
+        else:
+            backup_lines.append(f"⏏️ <code>{esc(d['path'])}</code> : {esc(d['reason'])}")
+    backup_state = ("<small>État actuel :<br>" + "<br>".join(backup_lines) + "</small>") if backup_lines else ""
+
     return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -1276,7 +1301,8 @@ def render_config_page(cfg, saved=False, error=""):
 </head>
 <body>
 <h1>🧹 Nettoyarr — Configuration</h1>
-<p><a href="/explorer" style="color:#e8e8e8">🔎 Ouvrir l'explorateur (choisir quoi supprimer)</a></p>
+<p><a href="/explorer" style="color:#e8e8e8">🔎 Ouvrir l'explorateur (choisir quoi supprimer)</a> ·
+  <a href="/jobs" style="color:#e8e8e8">📋 Tâches en cours et récentes</a></p>
 {banner}
 {auth_warning}
 <form method="POST" action="/config">
@@ -1328,6 +1354,27 @@ def render_config_page(cfg, saved=False, error=""):
     <input type="text" name="LINKS_SCAN_ROOT" value="{esc(cfg['LINKS_SCAN_ROOT'])}"></label>
   <small>Doit être monté dans le conteneur Nettoyarr <b>au même chemin que dans qBittorrent</b>, en écriture
     (ex. <code>/volume1/media:/media</code>), sinon les chemins remontés par qBittorrent ne correspondent à rien.</small>
+
+  <h2>Sauvegarde préalable sur disque externe</h2>
+  <div class="checkbox-row">
+    <input type="checkbox" id="BACKUP_ENABLED" name="BACKUP_ENABLED" {checked(cfg.get('BACKUP_ENABLED'))}>
+    <label for="BACKUP_ENABLED">Proposer de sauvegarder la release avant de la supprimer</label>
+  </div>
+  <small>Ajoute une case « 💾 Sauvegarder d'abord » (décochée) à la confirmation de suppression, dans
+    qBittorrent et dans l'explorateur. La release est copiée à la racine d'un disque d'archive branché,
+    puis ajoutée à son listing ; elle n'est supprimée qu'une fois la copie vérifiée. La copie est faite
+    même en DRY_RUN (elle ne détruit rien).</small>
+  <label>BACKUP_PATHS <small>(emplacement(s) du dock, un par ligne, ex. <code>/volumeUSB2/usbshare</code>)</small>
+    <textarea name="BACKUP_PATHS" style="min-height:50px">{esc(chr(10).join(cfg.get('BACKUP_PATHS') or []))}</textarea></label>
+  <label>BACKUP_LISTING_DIR <small>(dossier des listings disqueN….txt)</small>
+    <input type="text" name="BACKUP_LISTING_DIR" placeholder="/volumeUSB1/usbshare/Liste_disques_archives" value="{esc(cfg.get('BACKUP_LISTING_DIR') or '')}"></label>
+  <small>À monter dans le conteneur au même chemin. Pour le dock, monter le dossier <b>parent</b> avec
+    <code>:rslave</code> (ex. <code>/volumeUSB2:/volumeUSB2:rslave</code>) afin qu'un disque branché ou changé
+    après le démarrage soit vu. Sur Synology, il faut d'abord rendre les montages partagés
+    (<code>mount --make-rshared /</code> en root, à chaque démarrage via le planificateur de tâches) ; sinon,
+    sans <code>:rslave</code>, redémarrer le conteneur après chaque branchement.
+    Chaque disque est reconnu par un fichier <code>{BACKUP_MARKER}</code> à sa racine, contenant son numéro.</small>
+  {backup_state}
 
   <h2>Comportement</h2>
   <div class="checkbox-row">
@@ -1454,19 +1501,32 @@ DELETE_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 3600
 
 
+class JobCancelled(Exception):
+    """Annulation demandée par l'utilisateur (bouton Annuler)."""
+
+
 class Job:
-    def __init__(self, torrent_hash, with_links=True):
+    def __init__(self, torrent_hash, with_links=True, backup=False, name="", batch=None):
         self.id = uuid.uuid4().hex[:12]
         self.hash = torrent_hash
         self.with_links = with_links
+        self.backup = backup        # sauvegarde préalable sur disque externe
+        self.name = name or torrent_hash[:8]
+        self.batch = batch          # sélection d'origine (plusieurs torrents d'un même clic)
         self.created = self.updated = time.time()
-        self.state = "queued"  # queued → running → done
+        self.state = "queued"  # queued → running ⇄ waiting (question) → done
+        self.phase = None      # "backup" puis "delete"
         self.step = "En attente…"
         self.current = None
         self.total = None
         self.http_status = None
         self.result = None
+        self.unit = None  # "bytes" : current/total sont des octets (copie de sauvegarde)
         self.pending_links = None  # hardlinks proposés à la suppression (confirmés via /delete-links)
+        self.question = None   # question en attente de réponse (/job/answer)
+        self.answer = None
+        self.answer_event = threading.Event()
+        self.cancel_event = threading.Event()
         self.done_event = threading.Event()
 
     def update(self, step, current=None, total=None):
@@ -1476,8 +1536,42 @@ class Job:
     def finish(self, http_status, result):
         self.http_status, self.result = http_status, result
         self.state = "done"
+        self.question = None
         self.updated = time.time()
         self.done_event.set()
+
+    @property
+    def cancellable(self):
+        return self.state != "done" and self.phase != "delete" and not self.cancel_event.is_set()
+
+    def cancel(self):
+        if not self.cancellable:
+            return False
+        self.cancel_event.set()
+        self.answer_event.set()  # débloque une question en attente
+        if self.state == "queued":
+            self.update("Annulé avant de commencer")
+        return True
+
+    def ask(self, question):
+        """Met le job en attente d'une réponse (userscript ou page /jobs)."""
+        self.answer, self.answer_event = None, threading.Event()
+        self.question = dict(question, id=uuid.uuid4().hex[:8])
+        self.state = "waiting"
+        self.update("En attente de ta réponse…")
+        self.answer_event.wait()
+        self.question = None
+        self.state = "running"
+        if self.cancel_event.is_set():
+            raise JobCancelled()
+        return self.answer or {}
+
+    def reply(self, qid, answer):
+        if not self.question or self.question.get("id") != qid:
+            return False
+        self.answer = answer
+        self.answer_event.set()
+        return True
 
     def to_dict(self):
         now = time.time()
@@ -1485,40 +1579,139 @@ class Job:
         if self.total:
             percent = max(0, min(100, round(100 * (self.current or 0) / self.total)))
         return {
-            "ok": True, "id": self.id, "hash": self.hash, "state": self.state,
+            "ok": True, "id": self.id, "hash": self.hash, "name": self.name, "batch": self.batch,
+            "state": self.state, "phase": self.phase, "backup": self.backup,
             "step": self.step, "current": self.current, "total": self.total,
-            "percent": percent,
+            "percent": percent, "unit": self.unit,
+            "question": self.question, "cancellable": self.cancellable,
+            "cancelled": self.cancel_event.is_set(),
+            "links_pending": bool(self.pending_links),
+            "created": self.created,
             "elapsed": round(now - self.created),
             "idle": round(now - self.updated),  # secondes sans nouvelle progression
             "result": self.result,
         }
 
 
-def create_delete_job(torrent_hash, with_links=True):
-    job = Job(torrent_hash, with_links)
+# File d'attente unique, traitée dans l'ordre par un seul thread : les
+# torrents d'une sélection passent l'un après l'autre (sauvegarde puis
+# suppression), même si plus personne ne suit la progression.
+JOB_QUEUE = []
+JOB_QUEUE_COND = threading.Condition()
+
+
+def _jobs_purge():
+    now = time.time()
+    for jid in [j for j, x in JOBS.items() if x.state == "done" and now - x.updated > JOB_TTL_SECONDS]:
+        JOBS.pop(jid, None)
+
+
+def create_delete_job(torrent_hash, with_links=True, backup=False, name="", batch=None):
+    job = Job(torrent_hash, with_links, backup=backup, name=name, batch=batch)
     with JOBS_LOCK:
-        now = time.time()
-        for jid in [j for j, x in JOBS.items() if x.state == "done" and now - x.updated > JOB_TTL_SECONDS]:
-            JOBS.pop(jid, None)
+        _jobs_purge()
         JOBS[job.id] = job
-    threading.Thread(target=run_delete_job, args=(job,), daemon=True).start()
+    with JOB_QUEUE_COND:
+        JOB_QUEUE.append(job)
+        JOB_QUEUE_COND.notify()
     return job
 
 
+def job_worker_loop():
+    while True:
+        with JOB_QUEUE_COND:
+            while not JOB_QUEUE:
+                JOB_QUEUE_COND.wait()
+            job = JOB_QUEUE.pop(0)
+        try:
+            run_delete_job(job)
+        except Exception as e:  # ne jamais laisser mourir le worker
+            log.exception(f"Job {job.id} : erreur inattendue")
+            if job.state != "done":
+                job.finish(500, {"ok": False, "error": f"Erreur interne nettoyarr : {e}"})
+
+
+def jobs_list(batch=None):
+    with JOBS_LOCK:
+        _jobs_purge()
+        jobs = [j for j in JOBS.values() if j.hash != "inventory" and (not batch or j.batch == batch)]
+    return sorted((j.to_dict() for j in jobs), key=lambda d: d["created"])
+
+
+def _cancelled_result():
+    return 200, {"ok": False, "kind": "cancelled", "error": "annulé : rien n'a été supprimé"}
+
+
+def run_job_backup(job):
+    """Sauvegarde préalable, avec ses questions éventuelles. Renvoie None pour
+    continuer vers la suppression, ou (code, payload) pour s'arrêter là."""
+    job.phase = "backup"
+    job.unit = "bytes"
+    note = ""
+    while True:
+        if job.cancel_event.is_set():
+            raise JobCancelled()
+        code, payload = backup_by_hash(job.hash, job.update, job.cancel_event)
+        if payload.get("ok"):
+            job.backup_result = payload
+            return None
+        need = payload.get("need")
+        if need == "identify":
+            ans = job.ask({"type": "identify", "path": payload["path"], "free": payload["free"],
+                           "total": payload["total"], "suggested": payload["suggested"], "note": note})
+            if ans.get("choice") != "identify":
+                return 200, {"ok": False, "kind": "skipped", "error": "non supprimé (pas de sauvegarde)"}
+            try:
+                number = int(ans.get("disk"))
+            except (TypeError, ValueError):
+                number = None
+            c, p = backup_identify(payload["path"], number)
+            note = "" if p.get("ok") else p.get("error", "")
+            continue
+        q = {"type": "disk", "size": payload.get("size"), "disks": payload.get("disks", [])} if need == "disk" \
+            else {"type": "error", "error": payload.get("error", "erreur inconnue")}
+        ans = job.ask(q)
+        choice = ans.get("choice")
+        if choice == "retry":
+            continue
+        if choice == "skip":
+            job.backup_result = {"ok": False, "kind": "skipped_backup"}
+            return None
+        return 200, {"ok": False, "kind": "skipped", "error": "non supprimé (pas de sauvegarde)"}
+
+
 def run_delete_job(job):
-    if not DELETE_LOCK.acquire(blocking=False):
-        job.update("En attente de la fin du nettoyage précédent…")
-        DELETE_LOCK.acquire()
-    try:
-        job.state = "running"
-        code, payload = delete_by_hash(job.hash, job.update, with_links=job.with_links)
-    except Exception as e:
-        log.exception(f"/delete-by-hash ({job.hash[:8]}) : erreur inattendue")
-        code, payload = 500, {"ok": False, "error": f"Erreur interne nettoyarr : {e}"}
-    finally:
-        DELETE_LOCK.release()
+    job.backup_result = None
+    if job.cancel_event.is_set():
+        job.finish(*_cancelled_result())
+        return
+    job.state = "running"
+    if job.backup:
+        try:
+            stop = run_job_backup(job)
+        except JobCancelled:
+            log.info(f"Job {job.id} ({job.name}) : annulé pendant la sauvegarde")
+            job.finish(*_cancelled_result())
+            return
+        if stop:
+            job.finish(*stop)
+            return
+        if job.cancel_event.is_set():
+            job.finish(*_cancelled_result())
+            return
+    job.phase = "delete"  # à partir d'ici, plus d'annulation possible
+    job.unit = None
+    job.update("Démarrage de la suppression…")
+    with DELETE_LOCK:
+        try:
+            code, payload = delete_by_hash(job.hash, job.update, with_links=job.with_links)
+        except Exception as e:
+            log.exception(f"/delete-by-hash ({job.hash[:8]}) : erreur inattendue")
+            code, payload = 500, {"ok": False, "error": f"Erreur interne nettoyarr : {e}"}
     if isinstance(payload, dict):
         job.pending_links = payload.pop("_pending_links", None)
+        if job.backup_result:
+            payload["backup"] = job.backup_result
     log.info(f"/delete-by-hash ({job.hash[:8]}) : {payload}")
     if code == 200 and isinstance(payload, dict) and payload.get("ok") and not DRY_RUN:
         inventory_forget(job.hash)
@@ -1649,6 +1842,443 @@ def delete_by_hash(torrent_hash, step=_noop_step, with_links=True):
             + " ; ".join(arr_errors[:3]))}
     return delete_orphan(torrent, step, qbit_progress, qbit_wait, with_links=with_links)
 
+
+
+# ── Sauvegarde préalable sur disque externe (optionnelle) ───────────────────
+# Avant une suppression lancée à la main (userscript qBit, Explorateur), la
+# release peut être copiée sur un disque d'archive branché au dock, et une
+# ligne « taille<TAB>nom » ajoutée au listing de ce disque. Rien n'est
+# supprimé tant que la copie n'est pas terminée, vérifiée (tailles) et
+# écrite physiquement sur le disque (fsync).
+#
+# Identification : fichier .nettoyarr-disque à la racine du disque, contenant
+# son numéro. Absent → l'utilisateur donne le numéro une fois (le suivant
+# libre est proposé) et le fichier est créé.
+# Listing : premier fichier « disqueN….txt » du dossier des listings (ex.
+# disque7_liste_films.txt), créé sous le nom disqueN_liste.txt s'il n'existe
+# pas encore.
+#
+# Garde-fous : un chemin de BACKUP_PATHS sans disque branché est un simple
+# dossier sur la partition système du DSM (quelques Go) — une copie le
+# remplirait. On refuse donc tout ce qui est sur /dev/md0, sur le même
+# système de fichiers que /media ou /app/data, ou de moins de 32 Gio.
+#
+# La copie est faite même en DRY_RUN : elle ne détruit rien, seule la
+# suppression qui suit reste simulée.
+BACKUP_MARKER = ".nettoyarr-disque"
+BACKUP_MARGIN = 1024 ** 3                  # espace laissé libre en plus de la release
+BACKUP_MIN_CAPACITY = 32 * 1024 ** 3       # en dessous : pas un disque d'archive
+BACKUP_PARTIAL_SUFFIX = ".nettoyarr-partiel"
+BACKUP_CHUNK = 8 * 1024 * 1024
+BACKUP_FLUSH_EVERY = 256 * 1024 * 1024     # fdatasync + purge du cache de page
+BACKUP_LOCK = threading.Lock()
+BACKUP_SYSTEM_SOURCES = ("/dev/md0",)      # partition système Synology
+
+
+def _mountinfo_entry(path):
+    """Point de montage qui porte path dans le conteneur : (point, type, source).
+    En cas d'égalité (disque monté par-dessus le dossier vide), le dernier
+    montage listé est celui qui est visible."""
+    best = None
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as f:
+            for line in f:
+                left, _, right = line.partition(" - ")
+                parts, rparts = left.split(), right.split()
+                if len(parts) < 5 or len(rparts) < 2:
+                    continue
+                mnt = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[4])
+                if path == mnt or path.startswith(mnt.rstrip("/") + "/") or mnt == "/":
+                    if best is None or len(mnt) >= len(best[0]):
+                        best = (mnt, rparts[0], rparts[1])
+    except OSError:
+        pass
+    return best
+
+
+def _read_marker(path):
+    try:
+        with open(os.path.join(path, BACKUP_MARKER), encoding="utf-8") as f:
+            first = f.readline().strip()
+        return int(first) if first.isdigit() else None
+    except OSError:
+        return None
+
+
+def backup_inspect(path):
+    """État d'un emplacement de BACKUP_PATHS. usable=False → raison dans reason."""
+    info = {"path": path, "usable": False, "reason": "", "disk": None, "total": 0, "free": 0}
+    if not os.path.isdir(path):
+        info["reason"] = "dossier absent du conteneur (volume non monté dans le docker-compose ?)"
+        return info
+    try:
+        st = os.stat(path)
+        usage = shutil.disk_usage(path)
+    except OSError as e:
+        info["reason"] = f"illisible : {e}"
+        return info
+    info["total"], info["free"] = usage.total, usage.free
+    for other, label in ((LINKS_SCAN_ROOT, "la médiathèque"), (os.path.dirname(CONFIG_PATH), "/app/data")):
+        try:
+            if os.stat(other).st_dev == st.st_dev:
+                info["reason"] = f"même disque que {label} : aucun disque d'archive monté ici"
+                return info
+        except OSError:
+            pass
+    mnt = _mountinfo_entry(os.path.realpath(path))
+    if mnt and (mnt[2] in BACKUP_SYSTEM_SOURCES or mnt[0] == "/"):
+        info["reason"] = ("aucun disque branché (dossier sur la partition système)" if mnt[0] != "/"
+                          else "pas un point de montage : volume non monté dans le docker-compose ?")
+        return info
+    if usage.total < BACKUP_MIN_CAPACITY:
+        info["reason"] = f"trop petit ({_du_size(usage.total)}) : aucun disque d'archive branché ?"
+        return info
+    if not os.access(path, os.W_OK):
+        info["reason"] = "lecture seule (montage :ro, ou système de fichiers non inscriptible)"
+        return info
+    info["disk"] = _read_marker(path)
+    info["usable"] = True
+    return info
+
+
+def _du_size(b):
+    """Taille façon `du -h` (29G, 6.0G, 384M), comme dans les listings existants."""
+    b = float(b or 0)
+    for unit in ("", "K", "M", "G", "T", "P"):
+        if b < 1024 or unit == "P":
+            if unit == "":
+                return f"{int(b)}"
+            return f"{b:.1f}{unit}" if b < 10 else f"{math.ceil(b)}{unit}"
+        b /= 1024
+    return str(int(b))
+
+
+def _listing_pattern(n):
+    return re.compile(rf"^disque0*{n}(?!\d).*\.txt$", re.IGNORECASE)
+
+
+def backup_listing_file(n):
+    """Listing du disque n : existant (disqueN….txt), sinon disqueN_liste.txt."""
+    pat = _listing_pattern(n)
+    try:
+        found = sorted(x for x in os.listdir(BACKUP_LISTING_DIR) if pat.match(x))
+    except OSError:
+        found = []
+    return os.path.join(BACKUP_LISTING_DIR, found[0] if found else f"disque{n}_liste.txt")
+
+
+def backup_next_number(disks=()):
+    nums = [d["disk"] for d in disks if d.get("disk")]
+    try:
+        for x in os.listdir(BACKUP_LISTING_DIR):
+            m = re.match(r"^disque0*(\d+)", x, re.IGNORECASE)
+            if m:
+                nums.append(int(m.group(1)))
+    except OSError:
+        pass
+    return max(nums, default=0) + 1
+
+
+_LISTING_SIZE = re.compile(r"^\s*\d+(?:[.,]\d+)?\s*[KMGTP]i?B?\s+(.*)$", re.IGNORECASE)
+_VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".iso", ".wmv", ".mov", ".m4v")
+
+
+def _release_key(name):
+    """Nom comparable d'une release : 1er élément de chemin, sans extension
+    vidéo, en minuscules (les listings mélangent « taille<TAB>nom », nom de
+    fichier seul et chemin dossier/fichier)."""
+    name = (name or "").strip().strip("/").split("/", 1)[0].strip()
+    low = name.lower()
+    for ext in _VIDEO_EXT:
+        if low.endswith(ext):
+            low = low[: -len(ext)]
+            break
+    return low
+
+
+def backup_listings_index():
+    """{clé de release: [(n° disque, fichier listing)]} d'après tous les listings."""
+    index = {}
+    try:
+        files = sorted(os.listdir(BACKUP_LISTING_DIR))
+    except OSError:
+        return index
+    for fname in files:
+        m = re.match(r"^disque0*(\d+)(?!\d).*\.txt$", fname, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            with open(os.path.join(BACKUP_LISTING_DIR, fname), encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            mm = _LISTING_SIZE.match(line)
+            key = _release_key(mm.group(1) if mm else line)
+            if key:
+                entry = (int(m.group(1)), fname)
+                if entry not in index.setdefault(key, []):
+                    index[key].append(entry)
+    return index
+
+
+def backup_listed(names, index=None):
+    """Premier listing qui mentionne l'un des noms : {"disk", "listing"} ou None."""
+    index = backup_listings_index() if index is None else index
+    for n in names:
+        hits = index.get(_release_key(n))
+        if hits:
+            return {"disk": hits[0][0], "listing": hits[0][1], "disks": sorted({h[0] for h in hits})}
+    return None
+
+
+def backup_check(hashes):
+    """Releases d'une sélection déjà présentes dans un listing (avant de proposer)."""
+    found = {}
+    if not (BACKUP_ENABLED and BACKUP_LISTING_DIR and hashes):
+        return found
+    index = backup_listings_index()
+    qb.ensure_login()
+    torrents = json.loads(qb._req("/api/v2/torrents/info?hashes=" + "|".join(hashes)))
+    for t in torrents:
+        names = [t.get("name", ""), os.path.basename((t.get("content_path") or "").rstrip("/"))]
+        hit = backup_listed(names, index)
+        if hit:
+            found[t["hash"]] = dict(hit, name=t.get("name", ""))
+    return found
+
+
+def backup_listing_add(n, name, size):
+    """Ajoute « taille<TAB>nom » au listing du disque n, sauf si le nom y est déjà."""
+    path = backup_listing_file(n)
+    existing = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+    for line in existing.splitlines():
+        if line.strip() == name or line.rstrip().endswith("\t" + name) or line.rstrip().endswith(" " + name):
+            return path, False
+    with open(path, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        f.write(f"{_du_size(size)}\t{name}\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return path, True
+
+
+def backup_identify(path, number):
+    """Crée le fichier repère d'un disque pas encore identifié."""
+    if path not in BACKUP_PATHS:
+        return 400, {"ok": False, "error": "Emplacement inconnu (absent de BACKUP_PATHS)"}
+    if not (isinstance(number, int) and 1 <= number <= 9999):
+        return 400, {"ok": False, "error": "Numéro de disque invalide"}
+    info = backup_inspect(path)
+    if not info["usable"]:
+        return 409, {"ok": False, "error": f"{path} : {info['reason']}"}
+    if info["disk"]:
+        return 409, {"ok": False, "error": f"{path} est déjà identifié comme disque {info['disk']}"}
+    for other in BACKUP_PATHS:
+        if other != path and _read_marker(other) == number:
+            return 409, {"ok": False, "error": f"Le disque {number} est déjà branché sur {other}"}
+    marker = os.path.join(path, BACKUP_MARKER)
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(f"{number}\n")
+        f.flush()
+        os.fsync(f.fileno())
+    log.info(f"Sauvegarde : {path} identifié comme disque {number} ({marker})")
+    return 200, {"ok": True, "disk": number, "listing": backup_listing_file(number)}
+
+
+def backup_status():
+    disks = [backup_inspect(p) for p in BACKUP_PATHS]
+    listing_ok = bool(BACKUP_LISTING_DIR) and os.path.isdir(BACKUP_LISTING_DIR) and os.access(BACKUP_LISTING_DIR, os.W_OK)
+    return {"ok": True, "enabled": BACKUP_ENABLED, "dry_run": DRY_RUN, "paths": BACKUP_PATHS,
+            "listing_dir": BACKUP_LISTING_DIR, "listing_ok": listing_ok, "disks": disks}
+
+
+def _backup_files(torrent):
+    """[(chemin relatif, chemin source, taille)] des fichiers présents du torrent."""
+    save = torrent.get("save_path") or ""
+    out, missing = [], []
+    for f in qb.get_files(torrent["hash"]):
+        rel = os.path.normpath(f.get("name", ""))
+        if not rel or rel.startswith("..") or os.path.isabs(rel):
+            continue
+        src = os.path.join(save, rel)
+        try:
+            st = os.stat(src)
+        except OSError:
+            if (f.get("progress") or 0) >= 1:
+                missing.append(src)
+            continue  # fichier non téléchargé (priorité 0) : rien à sauvegarder
+        if stat.S_ISREG(st.st_mode):
+            out.append((rel, src, st.st_size))
+    return out, missing
+
+
+def _same_copy(dest_root, files):
+    return all(os.path.isfile(os.path.join(dest_root, rel)) and
+               os.path.getsize(os.path.join(dest_root, rel)) == size for rel, _, size in files)
+
+
+def _copy_files(files, dest_root, top, total, step, label, cancel=None):
+    """Copie dans top+suffixe partiel, vérifie, puis renomme en top."""
+    final, partial = os.path.join(dest_root, top), os.path.join(dest_root, top + BACKUP_PARTIAL_SUFFIX)
+    if os.path.isdir(partial):
+        shutil.rmtree(partial)
+    elif os.path.exists(partial):
+        os.remove(partial)
+    single = len(files) == 1 and files[0][0] == top  # torrent d'un seul fichier, sans dossier
+    done, t0, last = 0, time.time(), 0.0
+    buf = bytearray(BACKUP_CHUNK)
+    view = memoryview(buf)
+    try:
+        for rel, src, size in files:
+            dst = partial if single else os.path.join(partial, os.path.relpath(rel, top))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(src, "rb", buffering=0) as fi, open(dst, "wb", buffering=0) as fo:
+                since_flush = 0
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise JobCancelled()
+                    n = fi.readinto(buf)
+                    if not n:
+                        break
+                    fo.write(view[:n])
+                    done += n
+                    since_flush += n
+                    if since_flush >= BACKUP_FLUSH_EVERY:
+                        # Données réellement écrites (progression honnête) et
+                        # cache de page libéré : une copie de 40 Go ne doit pas
+                        # chasser de la mémoire ce que Plex lit au même moment.
+                        os.fdatasync(fo.fileno())
+                        for fd in (fi.fileno(), fo.fileno()):
+                            try:
+                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            except (AttributeError, OSError):
+                                pass
+                        since_flush = 0
+                    now = time.time()
+                    if now - last >= 0.5:
+                        last = now
+                        speed = done / max(now - t0, 0.001) / 1e6
+                        step(f"{label} : {done / 1024 ** 3:.1f} / {total / 1024 ** 3:.1f} Gio · {speed:.0f} Mo/s"
+                             .replace(".", ","), done, total)
+                os.fsync(fo.fileno())
+            try:
+                shutil.copystat(src, dst)
+            except OSError:
+                pass  # exFAT/NTFS : dates/droits pas toujours conservables, sans gravité
+        step(f"{label} : vérification", total, total)
+        for rel, _, size in files:
+            dst = partial if single else os.path.join(partial, os.path.relpath(rel, top))
+            if os.path.getsize(dst) != size:
+                raise OSError(f"taille incorrecte après copie : {rel}")
+        os.rename(partial, final)
+        try:
+            fd = os.open(dest_root, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            shutil.rmtree(partial) if os.path.isdir(partial) else os.remove(partial)
+        except OSError:
+            pass
+        raise
+    return final, time.time() - t0
+
+
+def backup_by_hash(torrent_hash, step=_noop_step, cancel=None):
+    """Sauvegarde la release d'un torrent sur un disque d'archive.
+    Réponses sans copie possible (ok=False) : need="identify" (disque branché
+    sans fichier repère), need="disk" (aucun disque avec assez de place)."""
+    if not BACKUP_ENABLED:
+        return 400, {"ok": False, "error": "Sauvegarde préalable désactivée dans la configuration"}
+    if not BACKUP_PATHS:
+        return 400, {"ok": False, "error": "Aucun emplacement de disque d'archive configuré (BACKUP_PATHS)"}
+    if not (BACKUP_LISTING_DIR and os.path.isdir(BACKUP_LISTING_DIR) and os.access(BACKUP_LISTING_DIR, os.W_OK)):
+        return 400, {"ok": False, "error": f"Dossier des listings absent ou non inscriptible : {BACKUP_LISTING_DIR or '(non configuré)'}"}
+
+    step("Sauvegarde : lecture du torrent dans qBittorrent")
+    try:
+        torrent = qb.get_torrent(torrent_hash)
+    except Exception as e:
+        return 500, {"ok": False, "error": f"qBittorrent injoignable : {e}"}
+    if not torrent:
+        return 200, {"ok": True, "kind": "gone", "message": "déjà absent de qBittorrent, rien à sauvegarder"}
+    files, missing = _backup_files(torrent)
+    if missing:
+        return 404, {"ok": False, "error": f"{len(missing)} fichier(s) introuvable(s), ex. {missing[0]} (montage /media ?)"}
+    if not files:
+        return 404, {"ok": False, "error": "Aucun fichier de la release trouvé sur le disque"}
+    tops = {rel.split(os.sep, 1)[0] for rel, _, _ in files}
+    if len(tops) != 1:
+        return 500, {"ok": False, "error": "Structure de torrent inattendue (plusieurs racines)"}
+    top = tops.pop()
+    total = sum(size for _, _, size in files)
+
+    # Déjà dans un listing (sauvegarde antérieure, même manuelle) : pas de
+    # nouvelle copie, la suppression peut suivre.
+    listed = backup_listed([top, torrent.get("name", "")])
+    if listed:
+        return 200, {"ok": True, "kind": "listed", "disk": listed["disk"], "disks": listed["disks"],
+                     "listing": listed["listing"], "size": total}
+
+    step("Sauvegarde : recherche d'un disque d'archive")
+    disks = [backup_inspect(p) for p in BACKUP_PATHS]
+
+    # Déjà sauvegardée (même nom, mêmes tailles) : pas de nouvelle copie.
+    for d in disks:
+        if d["usable"] and d["disk"] and _same_copy(d["path"], files):
+            listing, added = backup_listing_add(d["disk"], top, total)
+            return 200, {"ok": True, "kind": "already", "disk": d["disk"], "dest": os.path.join(d["path"], top),
+                         "size": total, "listing": listing, "listing_added": added}
+
+    fits = [d for d in disks if d["usable"] and d["free"] >= total + BACKUP_MARGIN]
+    target = next((d for d in fits if d["disk"]), None)
+    if not target:
+        unknown = next((d for d in fits if not d["disk"]), None)
+        if unknown:
+            return 409, {"ok": False, "need": "identify", "path": unknown["path"], "size": total,
+                         "free": unknown["free"], "total": unknown["total"],
+                         "suggested": backup_next_number(disks), "name": top}
+        return 409, {"ok": False, "need": "disk", "size": total + BACKUP_MARGIN, "name": top, "disks": disks}
+
+    n, root = target["disk"], target["path"]
+    if os.path.exists(os.path.join(root, top)):
+        return 409, {"ok": False, "error": f"{top} existe déjà sur le disque {n}, avec un contenu différent : rien copié, rien supprimé"}
+
+    if not BACKUP_LOCK.acquire(blocking=False):
+        step("Sauvegarde : attente de la fin d'une autre copie…")
+        BACKUP_LOCK.acquire()
+    if cancel is not None and cancel.is_set():
+        BACKUP_LOCK.release()
+        raise JobCancelled()
+    try:
+        log.info(f"Sauvegarde : copie de {top} ({_du_size(total)}) vers le disque {n} ({root})")
+        try:
+            dest, seconds = _copy_files(files, root, top, total, step, f"Copie sur le disque {n}", cancel)
+        except OSError as e:
+            log.error(f"Sauvegarde de {top} sur le disque {n} échouée : {e}")
+            return 500, {"ok": False, "error": f"Copie sur le disque {n} échouée : {e}"}
+    finally:
+        BACKUP_LOCK.release()
+    step(f"Sauvegarde : mise à jour du listing du disque {n}")
+    try:
+        listing, added = backup_listing_add(n, top, total)
+    except OSError as e:
+        # La copie est bonne : on ne bloque pas la suppression pour le listing,
+        # mais on le signale clairement.
+        log.error(f"Sauvegarde : listing du disque {n} non mis à jour : {e}")
+        listing, added = f"ÉCHEC ({e})", False
+    log.info(f"Sauvegarde : {top} copié sur le disque {n} en {seconds:.0f} s, listing {listing}")
+    return 200, {"ok": True, "kind": "saved", "disk": n, "dest": dest, "size": total, "seconds": round(seconds),
+                 "listing": listing, "listing_added": added}
 
 
 # ── Hardlinks restants et torrents orphelins ────────────────────────────────
@@ -2740,7 +3370,8 @@ def inventory_status():
     if job and job.state != "done":
         return {"state": "building", "job_id": job.id}
     if data:
-        out = {"state": "ready", "dry_run": DRY_RUN, "tracker_names": TRACKER_NAMES, **data}
+        out = {"state": "ready", "dry_run": DRY_RUN, "backup_enabled": BACKUP_ENABLED,
+               "tracker_names": TRACKER_NAMES, **data}
         if job and job.result and not job.result.get("ok"):
             out["last_error"] = job.result.get("error")
         return out
@@ -2886,6 +3517,7 @@ EXPLORER_HTML = r"""<!DOCTYPE html>
   </div>
   <span class="dry" id="dry" hidden>DRY_RUN actif : rien ne sera réellement supprimé</span>
   <span style="flex:1"></span>
+  <a href="/jobs" style="margin-right:14px">📋 Tâches</a>
   <a href="/config">⚙️ Configuration</a>
 </header>
 
@@ -2955,13 +3587,13 @@ async function api(path, opts) {
 }
 
 // ── Progression d'un job serveur (/job) ─────────────────────────────────
-function setStatus(text, current, total) {
+function setStatus(text, current, total, unit) {
   $("status").textContent = text || "";
   const bar = $("progress");
   if (typeof total === "number" && total > 0 && typeof current === "number") {
     bar.style.display = "block";
     bar.firstElementChild.style.width = Math.round((100 * current) / total) + "%";
-    $("status").textContent += ` — ${current}/${total}`;
+    if (unit !== "bytes") $("status").textContent += ` — ${current}/${total}`;
   } else {
     bar.style.display = text ? "block" : "none";
     bar.firstElementChild.style.width = text ? "100%" : "0";
@@ -2980,7 +3612,12 @@ async function follow(jobId, prefix = "") {
     }
     failures = 0;
     if (r.data.state === "done") return { status: 200, data: r.data.result, jobId };
-    setStatus(prefix + r.data.step, r.data.current, r.data.total);
+    if (r.data.state === "waiting" && r.data.question) {
+      setStatus(prefix + "en attente de ta réponse…");
+      await answerQuestion(r.data);
+      continue;
+    }
+    setStatus(prefix + r.data.step, r.data.current, r.data.total, r.data.unit);
   }
 }
 
@@ -3399,6 +4036,80 @@ function modal(message, { cancel = true, okLabel = "OK" } = {}) {
   });
 }
 
+// Popup à boutons multiples, avec case à cocher et/ou champ de saisie
+// optionnels. Renvoie { value, checked, text } (value null si fermée).
+function ask(message, { buttons = [], check = null, input = null } = {}) {
+  return new Promise((resolve) => {
+    const row = el("div", { class: "row" });
+    const extra = el("div", {});
+    let cb = null, field = null;
+    if (input) {
+      field = el("input", { type: "number", min: "1", value: String(input.value ?? "") });
+      field.style.cssText = "width:8em;margin:0 0 14px 8px;";
+      extra.append(el("label", { text: input.label }, field));
+    }
+    if (check) {
+      cb = el("input", { type: "checkbox" });
+      cb.checked = !!check.checked;
+      const lab = el("label", {}, cb, " " + check.label);
+      lab.style.cssText = "display:block;margin:0 0 16px;cursor:pointer;";
+      extra.append(lab);
+    }
+    const box = el("div", { class: "modal" }, el("div", {}, el("strong", { text: "🧹 Nettoyarr" }), el("div", { class: "msg", text: message }), extra, row));
+    const close = (value) => { box.remove(); resolve({ value, checked: cb ? cb.checked : false, text: field ? field.value : "" }); };
+    let focus = null;
+    for (const b of buttons) {
+      const btn = el("button", { class: b.primary ? "primary" : "", text: b.label });
+      btn.onclick = () => close(b.value);
+      row.append(btn);
+      if (b.primary) focus = btn;
+    }
+    document.body.append(box);
+    (field || focus || row.lastElementChild).focus();
+  });
+}
+
+// ── Sauvegarde préalable : questions posées par le serveur ──────────────
+// Le serveur enchaîne sauvegarde puis suppression (backup=1) ; s'il lui
+// manque une réponse (numéro du disque, disque plein…), le job passe en
+// état "waiting" avec une question, à laquelle on répond ici.
+async function answerQuestion(job) {
+  const q = job.question;
+  let body;
+  if (q.type === "identify") {
+    const a = await ask(
+      `${job.name}\n\nDisque d'archive non identifié branché sur ${q.path} (${fmtSize(q.free)} libres sur ${fmtSize(q.total)}).\n\n` +
+      "Quel est son numéro ? Un fichier repère sera créé à sa racine, et la release ajoutée au listing disqueN….txt " +
+      "correspondant (créé s'il n'existe pas)." + (q.note ? `\n\n❌ ${q.note}` : ""),
+      { input: { label: "Disque n°", value: q.suggested },
+        buttons: [{ label: "Ne pas supprimer", value: "abort" }, { label: "Identifier et sauvegarder", value: "identify", primary: true }] });
+    body = { choice: a.value, disk: a.text };
+  } else {
+    const msg = q.type === "disk"
+      ? `${job.name}\n\nAucun disque d'archive branché avec assez de place (${fmtSize(q.size)} nécessaires).\n\n` +
+        (q.disks || []).map((x) => `• ${x.path} : ${x.usable ? `disque ${x.disk || "?"}, ${fmtSize(x.free)} libres` : x.reason}`).join("\n") +
+        "\n\nBranche un disque dans le dock, puis réessaie."
+      : `${job.name}\n\n❌ Sauvegarde impossible :\n${q.error}\n\nLa release n'a pas été supprimée.`;
+    const a = await ask(msg, { buttons: [
+      { label: "Ne pas supprimer", value: "abort" },
+      { label: "Supprimer sans sauvegarder", value: "skip" },
+      { label: "Réessayer", value: "retry", primary: true }] });
+    body = { choice: a.value };
+  }
+  await api(`/job/answer?id=${encodeURIComponent(job.id)}&q=${encodeURIComponent(q.id)}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+function formatBackup(b) {
+  if (!b) return "";
+  if (b.kind === "skipped_backup") return "⚠️ supprimée sans sauvegarde (choix manuel)\n";
+  if (b.kind === "listed") return `💾 déjà sauvegardée sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+  if (!b.ok) return "";
+  const how = b.kind === "already" ? "déjà présente sur" : "copiée sur";
+  const lst = b.listing_added ? `, ajoutée à ${String(b.listing).split("/").pop()}`
+    : String(b.listing).startsWith("ÉCHEC") ? ` — ⚠️ listing ${b.listing}` : "";
+  return `💾 ${how} le disque ${b.disk} (${fmtSize(b.size)}${b.seconds ? `, ${b.seconds} s` : ""})${lst}\n`;
+}
+
 // ── Suppression (mêmes endpoints que le bouton qBittorrent) ─────────────
 function formatLinks(l) {
   if (!l) return "";
@@ -3414,6 +4125,13 @@ function formatLinks(l) {
 }
 
 function formatResult(d, rel) {
+  const line = formatResultCore(d, rel);
+  const b = d && formatBackup(d.backup);
+  return b && line ? b + line : line;
+}
+
+function formatResultCore(d, rel) {
+  if (d && (d.kind === "skipped" || d.kind === "cancelled")) return `⏭️ ${rel.title} : ${d.error}`;
   if (d && d.ok) {
     const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent(s) qBit)` : "";
     if (d.kind === "movie") return `✅ ${d.title} : supprimé de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
@@ -3477,13 +4195,28 @@ async function deleteSelected() {
   if (!rels.length) return;
   const total = rels.reduce((a, r) => a + r.size, 0);
   const shown = rels.slice(0, 15).map((r) => `• ${r.title} (${fmtSize(r.size)})`).join("\n");
-  const ok = await modal(
-    `Supprimer définitivement ${rels.length} release(s), ${fmtSize(total)} :\n\n${shown}` +
+  // Releases déjà présentes dans un listing de disque d'archive : signalées
+  // ici, et jamais recopiées même si la case est cochée.
+  let saved = "";
+  if (DATA.backup_enabled) {
+    const chk = await api("/backup/check", { method: "POST", body: JSON.stringify({ hashes: rels.flatMap((r) => r.hashes) }) });
+    const found = (chk.data && chk.data.found) || {};
+    const lines = rels.map((r) => {
+      const h = r.hashes.find((x) => found[x]);
+      return h ? `• ${r.title} → disque ${found[h].disks.join(", ")}` : null;
+    }).filter(Boolean);
+    if (lines.length) saved = `\n\n💾 Déjà sauvegardée(s) (ne sera pas recopié) :\n${lines.slice(0, 15).join("\n")}` +
+      (lines.length > 15 ? `\n… +${lines.length - 15} autre(s)` : "");
+  }
+  const confirm = await ask(
+    `Supprimer définitivement ${rels.length} release(s), ${fmtSize(total)} :\n\n${shown}${saved}` +
     (rels.length > 15 ? `\n… +${rels.length - 15} autre(s)` : "") +
     "\n\nFichiers, qBittorrent (tous les trackers), Radarr/Sonarr, et Seerr pour les films." +
-    (DATA.dry_run ? "\n\nDRY_RUN actif : simulation seulement." : ""),
-    { okLabel: "Supprimer" });
-  if (!ok) return;
+    (DATA.dry_run ? "\n\nDRY_RUN actif : simulation seulement (la sauvegarde, elle, est réelle)." : ""),
+    { check: DATA.backup_enabled ? { label: "💾 Sauvegarder d'abord sur un disque d'archive (dock)" } : null,
+      buttons: [{ label: "Annuler", value: false }, { label: "Supprimer", value: true, primary: true }] });
+  if (!confirm.value) return;
+  const withBackup = confirm.checked;
 
   BUSY = true; render();
   rels = await revalidate(rels);
@@ -3498,7 +4231,8 @@ async function deleteSelected() {
     // cross-seed ; les suivants ne sont traités que s'ils ont survécu.
     for (let j = 0; j < rel.hashes.length; j++) {
       setStatus(prefix + "démarrage…");
-      const start = await api(`/delete-by-hash?hash=${encodeURIComponent(rel.hashes[j])}&async=1`);
+      const start = await api(`/delete-by-hash?hash=${encodeURIComponent(rel.hashes[j])}&async=1` +
+        (withBackup ? `&backup=1&name=${encodeURIComponent(rel.title)}` : ""));
       const jobId = start.data && start.data.job_id;
       const res = jobId ? await follow(jobId, prefix) : { data: start.data || { ok: false, error: `HTTP ${start.status}` } };
       const line = formatResult(res.data, rel);
@@ -3579,6 +4313,265 @@ api("/explorer/criteria").then((r) => {
 """
 
 
+# ── Page /jobs : suivi des suppressions (et sauvegardes) en cours ───────────
+# Tout est piloté par le serveur (file d'attente) : cette page ne fait que
+# suivre l'avancement, répondre aux questions (numéro de disque, disque
+# plein…), annuler, et proposer la suppression des hardlinks restants.
+JOBS_HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.85em' font-size='90'>🧹</text></svg>">
+<title>Nettoyarr — Tâches</title>
+<style>
+  :root { --bg:#15181c; --field:#22262b; --line:#3a3f45; --text:#e8e8e8; --muted:#9aa0a6; --accent:#c0392b; --ok:#2e7d4f; --warn:#e0a040; }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); max-width:820px; margin:24px auto; padding:0 16px; }
+  h1 { font-size:1.4em; margin-bottom:4px; }
+  a { color:var(--text); }
+  .nav { color:var(--muted); font-size:.9em; margin-bottom:16px; }
+  .bar { display:flex; gap:10px; align-items:center; margin:12px 0; flex-wrap:wrap; }
+  .dry { background:#3a2e1e; border:1px solid #5a4a2d; padding:8px 12px; border-radius:6px; margin-bottom:12px; }
+  .card { background:var(--field); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-top:12px; }
+  .card.done { opacity:.85; }
+  .head { display:flex; justify-content:space-between; gap:12px; align-items:baseline; }
+  .name { font-weight:600; overflow-wrap:anywhere; }
+  .badge { font-size:.8em; padding:2px 8px; border-radius:10px; border:1px solid var(--line); white-space:nowrap; color:var(--muted); }
+  .badge.run { color:#fff; border-color:var(--accent); background:var(--accent); }
+  .badge.wait { color:#15181c; background:var(--warn); border-color:var(--warn); }
+  .badge.ok { color:#fff; background:var(--ok); border-color:var(--ok); }
+  .step { margin-top:8px; color:var(--muted); font-size:.95em; }
+  .track { position:relative; height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:8px; }
+  .track > div { position:absolute; left:0; top:0; height:100%; background:var(--accent); border-radius:4px; transition:width .3s; }
+  .result { margin-top:10px; white-space:pre-line; line-height:1.5; overflow-wrap:anywhere; }
+  .q { margin-top:12px; padding:12px; border:1px solid var(--warn); border-radius:6px; white-space:pre-line; line-height:1.5; }
+  .q input { width:6em; padding:6px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; font:inherit; margin-left:6px; }
+  .q .note { color:#f08080; }
+  .row { display:flex; gap:8px; justify-content:flex-end; margin-top:10px; flex-wrap:wrap; }
+  button { padding:7px 14px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; cursor:pointer; font:inherit; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .empty { color:var(--muted); margin-top:20px; }
+</style>
+</head>
+<body>
+<h1>🧹 Nettoyarr — Tâches</h1>
+<div class="nav"><a href="/explorer">🔎 Explorateur</a> · <a href="/config">⚙️ Configuration</a> · <a href="/jobs">Toutes les tâches de la dernière heure</a></div>
+<p class="nav">Le traitement se poursuit côté serveur : tu peux fermer cette page, tout ira à son terme.
+  Seule exception : une question (disque à identifier, disque plein…) met la suite en attente jusqu'à ta réponse ici.
+  « Annuler » est possible tant que la suppression du torrent n'a pas commencé (en attente, sauvegarde, question).</p>
+<div id="dry" class="dry" hidden>DRY_RUN actif : les suppressions sont simulées (la sauvegarde, elle, est réelle).</div>
+<div class="bar" id="batchbar" hidden>
+  <span id="summary"></span>
+  <button id="cancelall">⏹ Tout annuler</button>
+</div>
+<div id="list"></div>
+<div id="empty" class="empty" hidden>Aucune tâche récente.</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const BATCH = new URLSearchParams(location.search).get("batch");
+const GIB = 1024 ** 3;
+const fmtSize = (b) => (b / GIB).toFixed(1).replace(".", ",") + " Gio";
+const CARDS = new Map();
+const LAST = new Map(); // dernier état connu : une tâche oubliée par le serveur (après 1 h) reste affichée
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const c of children) if (c != null) e.append(c);
+  return e;
+}
+
+async function api(path, opts) {
+  try {
+    const r = await fetch(path, opts);
+    let data = null;
+    try { data = await r.json(); } catch (e) {}
+    return { status: r.status, data };
+  } catch (e) {
+    return { status: 0, data: null };
+  }
+}
+
+function formatBackup(b) {
+  if (!b) return "";
+  if (b.kind === "skipped_backup") return "⚠️ supprimé sans sauvegarde (choix manuel)\n";
+  if (b.kind === "listed") return `💾 déjà sauvegardé sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+  if (!b.ok) return "";
+  const how = b.kind === "already" ? "déjà présent sur" : "copié sur";
+  const lst = b.listing_added ? `, ajouté à ${String(b.listing).split("/").pop()}`
+    : String(b.listing).startsWith("ÉCHEC") ? `\n⚠️ listing non mis à jour : ${b.listing}` : "";
+  return `💾 ${how} le disque ${b.disk} (${fmtSize(b.size)}${b.seconds ? `, ${b.seconds} s` : ""})${lst}\n`;
+}
+
+function formatLinks(l) {
+  if (!l) return "";
+  if (l.error) return `\n⚠️ autres hardlinks non vérifiés : ${l.error}`;
+  if (l.freed) return "\n💾 aucun autre lien : espace disque libéré";
+  let out = `\n🔗 ${l.remaining} autre(s) lien(s) ailleurs sur le NAS`;
+  if (l.deletable && l.deletable.length) out += ` (${l.deletable.length} supprimable(s), voir le bouton)`;
+  if (l.not_found) out += `, ${l.not_found} non localisé(s) (corbeille Synology ?)`;
+  return out;
+}
+
+function formatResult(d) {
+  if (!d) return "";
+  const backup = formatBackup(d.backup);
+  if (d.ok) {
+    const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent(s) qBit)` : "";
+    if (d.kind === "movie") return `${backup}✅ ${d.title} : supprimé de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
+    if (d.kind === "episodes") return `${backup}✅ ${d.summary} : ${d.count} épisode(s) supprimé(s) de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
+    if (d.kind === "orphan") {
+      const kept = d.kept && d.kept.length ? `\n⚠️ conservé (torrent plus large) : ${d.kept.join(", ")}` : "";
+      return `${backup}✅ ${d.title} : non géré par Radarr/Sonarr, supprimé de ${d.targets.join(" / ")}${qbit}${kept}${formatLinks(d.links)}`;
+    }
+    if (d.kind === "gone") return `${backup}ℹ️ ${d.message}`;
+  }
+  if (d.kind === "cancelled") return "⏹ " + d.error;
+  if (d.kind === "skipped") return "⏭️ " + d.error;
+  return `${backup}❌ ${d.error || "erreur inconnue"}`;
+}
+
+function badge(j) {
+  if (j.state === "done") {
+    const r = j.result || {};
+    if (r.ok) return ["Terminé", "ok"];
+    if (r.kind === "cancelled") return ["Annulé", ""];
+    if (r.kind === "skipped") return ["Non supprimé", ""];
+    return ["Échec", "run"];
+  }
+  if (j.state === "waiting") return ["Question", "wait"];
+  if (j.state === "queued") return [j.cancelled ? "Annulé" : "En attente", ""];
+  return [j.phase === "backup" ? "Sauvegarde" : "Suppression", "run"];
+}
+
+function questionText(q) {
+  if (q.type === "identify") {
+    return `Disque d'archive non identifié branché sur ${q.path} (${fmtSize(q.free)} libres sur ${fmtSize(q.total)}).\n` +
+      "Quel est son numéro ? Un fichier repère sera créé à sa racine, et la release ajoutée au listing disqueN….txt correspondant.";
+  }
+  if (q.type === "disk") {
+    return `Aucun disque d'archive branché avec assez de place (${fmtSize(q.size)} nécessaires).\n` +
+      (q.disks || []).map((x) => `• ${x.path} : ${x.usable ? `disque ${x.disk || "?"}, ${fmtSize(x.free)} libres` : x.reason}`).join("\n") +
+      "\nBranche un disque dans le dock, puis réessaie.";
+  }
+  return `❌ Sauvegarde impossible : ${q.error}`;
+}
+
+async function answer(j, body) {
+  const r = await api(`/job/answer?id=${encodeURIComponent(j.id)}&q=${encodeURIComponent(j.question.id)}`,
+    { method: "POST", body: JSON.stringify(body) });
+  if (!(r.data && r.data.ok)) alert((r.data && r.data.error) || `HTTP ${r.status}`);
+  poll();
+}
+
+function renderQuestion(j) {
+  const q = j.question;
+  const box = el("div", { class: "q", text: questionText(q) });
+  const row = el("div", { class: "row" });
+  if (q.type === "identify") {
+    if (q.note) box.append(el("div", { class: "note", text: "\n" + q.note }));
+    const input = el("input", { type: "number", min: "1", value: String(q.suggested) });
+    box.append(el("div", {}, el("label", { text: "\nDisque n°" }, input)));
+    const no = el("button", { text: "Ne pas supprimer" });
+    no.onclick = () => answer(j, { choice: "abort" });
+    const yes = el("button", { class: "primary", text: "Identifier et sauvegarder" });
+    yes.onclick = () => answer(j, { choice: "identify", disk: input.value });
+    row.append(no, yes);
+  } else {
+    for (const [label, choice, primary] of [["Ne pas supprimer", "abort"], ["Supprimer sans sauvegarder", "skip"], ["Réessayer", "retry", true]]) {
+      const b = el("button", { class: primary ? "primary" : "", text: label });
+      b.onclick = () => answer(j, { choice });
+      row.append(b);
+    }
+  }
+  box.append(row);
+  return box;
+}
+
+function card(j) {
+  let c = CARDS.get(j.id);
+  if (!c) {
+    c = { root: el("div", { class: "card" }), name: el("span", { class: "name" }), badge: el("span", { class: "badge" }),
+          step: el("div", { class: "step" }), track: el("div", { class: "track" }, el("div", {})),
+          result: el("div", { class: "result" }), qslot: el("div", {}), actions: el("div", { class: "row" }), qid: null, links: null };
+    c.root.append(el("div", { class: "head" }, c.name, c.badge), c.step, c.track, c.qslot, c.result, c.actions);
+    $("list").append(c.root);
+    CARDS.set(j.id, c);
+  }
+  c.name.textContent = j.name;
+  const [label, cls] = badge(j);
+  c.badge.textContent = label;
+  c.badge.className = "badge " + cls;
+  c.root.classList.toggle("done", j.state === "done");
+  const running = j.state !== "done";
+  c.step.textContent = running ? j.step + (j.total && j.unit !== "bytes" ? ` — ${j.current}/${j.total}` : "") : "";
+  c.track.hidden = !(running && j.total);
+  if (j.total) c.track.firstChild.style.width = Math.round((100 * (j.current || 0)) / j.total) + "%";
+  c.result.textContent = j.state === "done" ? formatResult(j.result) : "";
+  const qid = j.question ? j.question.id : null;
+  if (qid !== c.qid) {
+    c.qid = qid;
+    c.qslot.replaceChildren(qid ? renderQuestion(j) : "");
+  }
+  c.actions.replaceChildren();
+  if (j.cancellable) {
+    const b = el("button", { text: "⏹ Annuler" });
+    b.onclick = async () => { b.disabled = true; await api(`/job/cancel?id=${encodeURIComponent(j.id)}`, { method: "POST" }); poll(); };
+    c.actions.append(b);
+  }
+  if (j.links_pending && c.links === null) {
+    const del = (j.result && j.result.links && j.result.links.deletable) || [];
+    const total = del.reduce((a, x) => a + x.size, 0);
+    const b = el("button", { class: "primary", text: `Supprimer les ${del.length} hardlink(s) restants (${fmtSize(total)})` });
+    b.title = del.map((x) => x.path).join("\n");
+    b.onclick = async () => {
+      if (!confirm("Supprimer aussi ces fichiers (autres hardlinks hors qBittorrent) ?\n\n" + b.title)) return;
+      b.disabled = true;
+      const r = await api(`/delete-links?job=${encodeURIComponent(j.id)}`, { method: "POST" });
+      const d = r.data || {};
+      c.links = d.error ? `❌ ${d.error}` :
+        `🔗 ${(d.deleted || []).length} fichier(s) supprimé(s)${d.freed ? `, ${fmtSize(d.freed)} libérés` : ""}${d.dry_run ? " [DRY-RUN]" : ""}` +
+        (d.errors || []).map((e) => "\n   " + e).join("");
+      poll();
+    };
+    c.actions.append(b);
+  }
+  if (c.links) c.result.textContent += "\n" + c.links;
+}
+
+let TIMER = null;
+async function poll() {
+  clearTimeout(TIMER);
+  const r = await api("/jobs.json" + (BATCH ? `?batch=${encodeURIComponent(BATCH)}` : ""));
+  if (r.data && r.data.jobs) {
+    $("dry").hidden = !r.data.dry_run;
+    for (const j of r.data.jobs) { LAST.set(j.id, j); card(j); }
+    const jobs = [...LAST.values()];
+    $("empty").hidden = jobs.length > 0;
+    if (BATCH) {
+      const done = jobs.filter((j) => j.state === "done").length;
+      $("batchbar").hidden = false;
+      $("summary").textContent = `Sélection : ${done}/${jobs.length} traité(s)`;
+      $("cancelall").disabled = !jobs.some((j) => j.cancellable);
+    }
+  }
+  TIMER = setTimeout(poll, 1000);
+}
+$("cancelall").onclick = async () => {
+  $("cancelall").disabled = true;
+  await api(`/job/cancel?batch=${encodeURIComponent(BATCH)}`, { method: "POST" });
+  poll();
+};
+poll();
+</script>
+</body>
+</html>
+"""
+
+
 def run_webhook(handler_func, payload, path):
     try:
         handler_func(payload)
@@ -3616,6 +4609,28 @@ class Handler(BaseHTTPRequestHandler):
             if not check_auth(self):
                 return
             self._send_json(200, inventory_status())
+            return
+        if self.path.startswith("/jobs.json"):
+            if not check_auth(self):
+                return
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send_json(200, {"ok": True, "dry_run": DRY_RUN,
+                                  "jobs": jobs_list((params.get("batch") or [None])[0])})
+            return
+        if self.path.startswith("/jobs"):
+            if not check_auth(self):
+                return
+            body = JOBS_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/backup/status"):
+            if not check_auth(self):
+                return
+            self._send_json(200, backup_status())
             return
         if self.path.startswith("/health"):
             try:
@@ -3668,12 +4683,18 @@ class Handler(BaseHTTPRequestHandler):
         async_mode = (params.get("async") or ["0"])[0] == "1"
         # links=0 : pas de bilan des autres hardlinks (plus rapide). Défaut : activé.
         with_links = (params.get("links") or ["1"])[0] != "0"
+        # backup=1 : sauvegarde préalable sur disque externe, enchaînée par le serveur
+        backup = (params.get("backup") or ["0"])[0] == "1"
 
         if not torrent_hash:
             self._send_json(400, {"ok": False, "error": "Paramètre 'hash' manquant"})
             return
+        if backup and not BACKUP_ENABLED:
+            self._send_json(400, {"ok": False, "error": "Sauvegarde préalable désactivée dans la configuration"})
+            return
 
-        job = create_delete_job(torrent_hash, with_links)
+        job = create_delete_job(torrent_hash, with_links, backup=backup,
+                                name=(params.get("name") or [""])[0], batch=(params.get("batch") or [None])[0])
         if async_mode:
             self._send_json(202, {"ok": True, "job_id": job.id})
             return
@@ -3733,6 +4754,13 @@ class Handler(BaseHTTPRequestHandler):
         # dans params (peu importe la valeur) veut dire "coché".
         new_cfg["DRY_RUN"] = "DRY_RUN" in params
         new_cfg["QBIT_POLL_ENABLED"] = "QBIT_POLL_ENABLED" in params
+        new_cfg["BACKUP_ENABLED"] = "BACKUP_ENABLED" in params
+        new_cfg["BACKUP_PATHS"] = [x.strip().rstrip("/") for x in field("BACKUP_PATHS").splitlines()
+                                   if x.strip().rstrip("/")]
+        new_cfg["BACKUP_LISTING_DIR"] = field("BACKUP_LISTING_DIR").strip().rstrip("/")
+        if new_cfg["BACKUP_ENABLED"] and not (new_cfg["BACKUP_PATHS"] and new_cfg["BACKUP_LISTING_DIR"]):
+            self._send_config_page(new_cfg, error="Sauvegarde préalable : renseigne BACKUP_PATHS et BACKUP_LISTING_DIR")
+            return
 
         log_level = field("LOG_LEVEL", new_cfg["LOG_LEVEL"]).upper()
         if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
@@ -3821,6 +4849,80 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_delete_links()
             return
 
+        if self.path.startswith("/backup/check"):
+            if not check_auth(self):
+                return
+            try:
+                length = min(int(self.headers.get("Content-Length", 0)), 262144)
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                hashes = [str(h).strip().lower() for h in body.get("hashes", []) if str(h).strip()]
+                self._send_json(200, {"ok": True, "found": backup_check(hashes)})
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": f"Vérification des listings impossible : {e}"})
+            return
+
+        if self.path.startswith("/backup/identify"):
+            if not check_auth(self):
+                return
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                number = int((params.get("disk") or [""])[0])
+            except ValueError:
+                number = None
+            code, payload = backup_identify((params.get("path") or [""])[0], number)
+            self._send_json(code, payload)
+            return
+
+        if self.path.startswith("/batch"):
+            # Sélection de plusieurs torrents : tous mis en file d'attente d'un
+            # coup, traités dans l'ordre par le serveur (l'onglet peut fermer).
+            if not check_auth(self):
+                return
+            try:
+                length = min(int(self.headers.get("Content-Length", 0)), 262144)
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                hashes = [str(h).strip().lower() for h in body.get("hashes", []) if str(h).strip()]
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": f"Requête invalide : {e}"})
+                return
+            backup = bool(body.get("backup"))
+            if not hashes:
+                self._send_json(400, {"ok": False, "error": "Aucun torrent"})
+                return
+            if backup and not BACKUP_ENABLED:
+                self._send_json(400, {"ok": False, "error": "Sauvegarde préalable désactivée dans la configuration"})
+                return
+            names = body.get("names") if isinstance(body.get("names"), dict) else {}
+            batch = uuid.uuid4().hex[:10]
+            jobs = [create_delete_job(h, body.get("links", True) is not False, backup=backup,
+                                      name=str(names.get(h) or ""), batch=batch) for h in hashes]
+            self._send_json(202, {"ok": True, "batch": batch, "jobs": [j.id for j in jobs]})
+            return
+
+        if self.path.startswith("/job/answer") or self.path.startswith("/job/cancel"):
+            if not check_auth(self):
+                return
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            jid, batch = (params.get("id") or [""])[0], (params.get("batch") or [""])[0]
+            if self.path.startswith("/job/cancel"):
+                with JOBS_LOCK:
+                    targets = [j for j in JOBS.values() if (jid and j.id == jid) or (batch and j.batch == batch)]
+                n = sum(1 for j in targets if j.cancel())
+                log.info(f"Annulation demandée ({jid or 'lot ' + batch}) : {n} job(s) annulé(s)")
+                self._send_json(200, {"ok": True, "cancelled": n})
+                return
+            job = JOBS.get(jid)
+            try:
+                length = min(int(self.headers.get("Content-Length", 0)), 4096)
+                answer = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except Exception:
+                answer = {}
+            if not job or not job.reply((params.get("q") or [""])[0], answer):
+                self._send_json(409, {"ok": False, "error": "Question déjà traitée (réponse donnée ailleurs ?)"})
+                return
+            self._send_json(200, {"ok": True})
+            return
+
         if self.path.startswith("/config"):
             if not check_auth(self):
                 return
@@ -3862,6 +4964,7 @@ if __name__ == "__main__":
     log.info(f"Démarrage — DRY_RUN={DRY_RUN}")
     threading.Thread(target=qbit_cache_warmup, daemon=True).start()
     threading.Thread(target=links_index_loop, daemon=True).start()
+    threading.Thread(target=job_worker_loop, daemon=True).start()
 
     if QBIT_POLL_ENABLED:
         if not RADARR_INSTANCES:
@@ -3871,5 +4974,5 @@ if __name__ == "__main__":
         log.info("Poll qBit désactivé (QBIT_POLL_ENABLED=false)")
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
-    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /config, /explorer, /inventory, /delete-by-hash, /job, /delete-links, /file-delete, /item-delete)")
+    log.info(f"En écoute sur :{LISTEN_PORT} (/health, /config, /explorer, /inventory, /delete-by-hash, /batch, /job, /jobs, /delete-links, /backup, /file-delete, /item-delete)")
     server.serve_forever()

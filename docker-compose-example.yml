@@ -69,6 +69,12 @@ services:
       # ↑ Dossier indexé pour retrouver les autres hardlinks des fichiers
       # supprimés. Doit correspondre au montage des médias ci-dessous.
 
+      # - BACKUP_ENABLED=false
+      # - BACKUP_PATHS=/volumeUSB2/usbshare
+      # - BACKUP_LISTING_DIR=/volumeUSB1/usbshare/Liste_disques_archives
+      # ↑ Sauvegarde préalable de la release sur un disque d'archive (dock
+      # USB) avant suppression. Voir README, et les montages ci-dessous.
+
       # - LOG_LEVEL=INFO
 
       # - QBIT_POLL_ENABLED=false
@@ -107,6 +113,13 @@ services:
       # suppression, sur confirmation) et à la vérification du poll qBit.
       # Sans ce montage, les suppressions fonctionnent quand même, sans ce
       # bilan.
+
+      # ── OPTIONNEL : sauvegarde préalable sur disque externe ──────────
+      # - /volumeUSB2:/volumeUSB2:rslave
+      # - /volumeUSB1/usbshare/Liste_disques_archives:/volumeUSB1/usbshare/Liste_disques_archives
+      # Dossier PARENT du dock, avec :rslave pour voir un disque branché après
+      # le démarrage (sur Synology : `mount --make-rshared /` au démarrage,
+      # voir README). Le dossier des listings, en écriture, au même chemin.
 
     deploy:
       resources:

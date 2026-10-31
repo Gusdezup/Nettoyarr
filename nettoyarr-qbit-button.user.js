@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.7.0
+// @version      0.8.0
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // ⚠️ NE PAS ÉDITER @match ICI : déclare l'adresse de ton qBittorrent dans les
 // réglages du script de l'extension, qui survivent aux mises à jour :
@@ -138,6 +138,61 @@
   const nettoyarrConfirm = (message) => showModal(message, { withCancel: true });
   const nettoyarrAlert = (message) => showModal(message, { withCancel: false });
 
+  // Popup à boutons multiples, avec case à cocher et/ou champ de saisie
+  // optionnels. Renvoie { value, checked, text }.
+  function askModal(message, { buttons = [], check = null, input = null, handle = null } = {}) {
+    return new Promise((resolve) => {
+      const { overlay, box, row } = buildModalShell();
+      const body = document.createElement("div");
+      body.textContent = message;
+      body.style.cssText = "font-size:16px;white-space:pre-line;line-height:1.5;margin-bottom:16px;overflow-wrap:anywhere;max-height:55vh;overflow-y:auto;";
+      box.appendChild(body);
+
+      let field = null, cb = null;
+      if (input) {
+        const lab = document.createElement("label");
+        lab.textContent = input.label + " ";
+        lab.style.cssText = "display:block;margin-bottom:16px;";
+        field = document.createElement("input");
+        field.type = "number";
+        field.min = "1";
+        field.value = String(input.value ?? "");
+        field.style.cssText = "width:7em;padding:6px;background:#15181c;color:#e8e8e8;border:1px solid #3a3f45;border-radius:4px;font-size:16px;";
+        lab.appendChild(field);
+        box.appendChild(lab);
+      }
+      if (check) {
+        const lab = document.createElement("label");
+        lab.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:18px;cursor:pointer;";
+        cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !!check.checked;
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(check.label));
+        box.appendChild(lab);
+      }
+
+      let closed = false;
+      const close = (value) => {
+        if (closed) return;
+        closed = true;
+        overlay.remove();
+        resolve({ value, checked: cb ? cb.checked : false, text: field ? field.value : "" });
+      };
+      if (handle) handle.close = () => close(null); // fermeture externe (question réglée ailleurs)
+      let focus = null;
+      for (const b of buttons) {
+        const btn = makeButton(b.label, !!b.primary);
+        btn.onclick = () => close(b.value);
+        row.appendChild(btn);
+        if (b.primary) focus = btn;
+      }
+      box.appendChild(row);
+      document.body.appendChild(overlay);
+      (field || focus || row.lastElementChild).focus();
+    });
+  }
+
   // ── Popup de progression ────────────────────────────────────────────────
   // Affichée dès la confirmation, mise à jour à partir de l'état réel du job
   // côté serveur (/job) : étape en cours, compteur quand l'étape en a un
@@ -177,37 +232,22 @@
       "font-size:15px;white-space:pre-line;line-height:1.5;margin-top:14px;" +
       "max-height:40vh;overflow-y:auto;overflow-wrap:anywhere;";
 
-    // Arrière-plan : la popup est masquée (qBittorrent redevient utilisable),
-    // le suivi continue et une pastille en bas à droite affiche l'étape ; un
-    // clic dessus rouvre la popup. Elle se rouvre d'elle-même à la fin.
-    const bgRow = document.createElement("div");
-    bgRow.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
-    const bgBtn = makeButton("Continuer en arrière-plan", false);
-    bgRow.appendChild(bgBtn);
-
-    const pill = document.createElement("div");
-    pill.title = "Nettoyarr travaille — clic pour afficher le détail";
-    pill.style.cssText =
-      "position:fixed;right:16px;bottom:16px;z-index:99999;display:none;max-width:420px;" +
-      "background:#22262b;color:#e8e8e8;border:1px solid #c0392b;border-radius:18px;" +
-      "padding:8px 14px;font-family:system-ui,sans-serif;font-size:13px;cursor:pointer;" +
-      "box-shadow:0 4px 14px rgba(0,0,0,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-    document.body.appendChild(pill);
-
-    let pillStep = "";
-    const refreshPill = () => {
-      pill.textContent = `🧹 ${pillStep || "Nettoyarr"} · ${elapsedEl.textContent}`;
-    };
-    const showOverlay = () => {
-      pill.style.display = "none";
-      overlay.style.display = "flex";
-    };
-    bgBtn.onclick = () => {
-      overlay.style.display = "none";
-      pill.style.display = "block";
-      refreshPill();
-    };
-    pill.onclick = showOverlay;
+    // Annuler : arrête vraiment (copie en cours effacée, torrents suivants
+    // abandonnés) — sauf une suppression déjà commencée, menée à son terme.
+    // Page séparée : le serveur poursuit seul, la page /jobs prend le relais.
+    const actRow = document.createElement("div");
+    actRow.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:12px;";
+    const cancelBtn = makeButton("Annuler", false);
+    const pageBtn = makeButton("Continuer dans une page séparée", false);
+    actRow.appendChild(cancelBtn);
+    actRow.appendChild(pageBtn);
+    const showOverlay = () => { overlay.style.display = "flex"; };
+    const hint = document.createElement("div");
+    hint.textContent =
+      "Tu peux fermer cet onglet : Nettoyarr va au bout de la sélection tout seul. " +
+      "Seule exception : une question (disque à identifier, disque plein…) met la suite en attente " +
+      "jusqu'à ta réponse, sur la page séparée.";
+    hint.style.cssText = "font-size:13px;color:#aaa;line-height:1.4;margin-top:12px;";
 
     const progressBlock = document.createElement("div");
     progressBlock.appendChild(header);
@@ -215,7 +255,8 @@
     progressBlock.appendChild(track);
     progressBlock.appendChild(meta);
     progressBlock.appendChild(idleEl);
-    progressBlock.appendChild(bgRow);
+    progressBlock.appendChild(actRow);
+    progressBlock.appendChild(hint);
 
     box.appendChild(progressBlock);
     box.appendChild(results);
@@ -241,7 +282,6 @@
     const t0 = Date.now();
     const tick = () => {
       elapsedEl.textContent = "⏱ " + formatElapsed((Date.now() - t0) / 1000);
-      if (pill.style.display !== "none") refreshPill();
     };
     tick();
     const timer = setInterval(tick, 250);
@@ -251,10 +291,9 @@
       setTorrent(index, name) {
         header.textContent = torrentCount > 1 ? `Torrent ${index}/${torrentCount} — ${name}` : name;
       },
-      setStep(text, current, total, idle) {
+      setStep(text, current, total, idle, unit) {
         const hasCount = typeof total === "number" && total > 0 && typeof current === "number";
-        stepEl.textContent = hasCount ? `${text} — ${current}/${total}` : text;
-        pillStep = stepEl.textContent;
+        stepEl.textContent = hasCount && unit !== "bytes" ? `${text} — ${current}/${total}` : text;
         if (hasCount) {
           setIndeterminate(false);
           const pct = Math.max(0, Math.min(100, Math.round((100 * current) / total)));
@@ -269,6 +308,10 @@
             ? `⚠️ Aucune progression depuis ${idle} s — nettoyarr travaille toujours, rien n'est annulé`
             : "";
       },
+      onCancel(fn) { cancelBtn.onclick = () => { cancelBtn.disabled = true; cancelBtn.textContent = "Annulation…"; fn(); }; },
+      onDetach(fn) { pageBtn.onclick = fn; },
+      setCancellable(on) { if (cancelBtn.textContent === "Annuler") cancelBtn.disabled = !on; },
+      close() { clearInterval(timer); setIndeterminate(false); overlay.remove(); },
       addResult(text) {
         results.textContent += (results.textContent ? "\n\n" : "") + text;
         results.scrollTop = results.scrollHeight;
@@ -276,8 +319,7 @@
       finish() {
         clearInterval(timer);
         setIndeterminate(false);
-        showOverlay(); // résultat (et éventuelle confirmation des hardlinks) toujours affiché
-        pill.remove();
+        showOverlay();
         const total = formatElapsed((Date.now() - t0) / 1000);
         box.removeChild(progressBlock);
         const done = document.createElement("div");
@@ -326,7 +368,7 @@
     return nettoyarrRequest("GET", path, opts);
   }
 
-  function nettoyarrRequest(method, path, { timeout = 30000 } = {}) {
+  function nettoyarrRequest(method, path, { timeout = 30000, body = undefined } = {}) {
     const cfg = getConfig();
     const headers = {};
     if (cfg.authUser || cfg.authPass) {
@@ -337,6 +379,7 @@
         method,
         url: `${cfg.nettoyarrUrl}${path}`,
         headers,
+        data: body,
         timeout,
         onload: (res) => {
           let data = null;
@@ -355,43 +398,112 @@
     });
   }
 
-  // Lance le nettoyage d'un torrent en mode job, puis suit sa progression
-  // jusqu'au résultat final. Compatible avec une version de nettoyarr sans
-  // jobs : sa réponse (synchrone) est alors directement le résultat.
-  async function runDelete(hash, ui) {
-    const start = await nettoyarrGet(`/delete-by-hash?hash=${encodeURIComponent(hash)}&async=1`);
-    const jobId = start.data && start.data.job_id;
-    if (!jobId) return { status: start.status, data: start.data, raw: start.raw };
+  const formatSize = (b) => (b / 1024 ** 3).toFixed(2).replace(".", ",") + " Gio";
 
-    let failures = 0;
-    for (;;) {
-      await sleep(POLL_INTERVAL_MS);
-      const r = await nettoyarrGet(`/job?id=${encodeURIComponent(jobId)}`, { timeout: 10000 });
-
-      if (r.status === 404) {
-        return { status: 404, data: r.data, raw: r.raw };
-      }
-      if (r.status !== 200 || !r.data) {
-        failures += 1;
-        if (failures >= MAX_POLL_FAILURES) {
-          return {
-            status: r.status,
-            data: null,
-            raw: `Suivi interrompu (${r.raw || "HTTP " + r.status}) — le nettoyage continue peut-être côté serveur, vérifie les logs.`,
-          };
-        }
-        ui.setStep(`Connexion à nettoyarr perdue, nouvel essai (${failures}/${MAX_POLL_FAILURES})…`);
-        continue;
-      }
-
-      failures = 0;
-      const job = r.data;
-      if (job.state === "done") return { status: 200, data: job.result, raw: "", jobId };
-      ui.setStep(job.step, job.current, job.total, job.idle);
-    }
+  // ── Sauvegarde préalable sur disque externe ─────────────────────────────
+  async function backupEnabled() {
+    const r = await nettoyarrGet("/backup/status", { timeout: 8000 });
+    return !!(r.data && r.data.enabled);
   }
 
-  const formatSize = (b) => (b / 1024 ** 3).toFixed(2).replace(".", ",") + " Gio";
+  function formatBackup(b) {
+    if (!b) return "";
+    if (b.kind === "skipped_backup") return "⚠️ supprimé sans sauvegarde (choix manuel)\n";
+    if (b.kind === "listed") return `💾 déjà sauvegardé sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+    if (!b.ok) return "";
+    const how = b.kind === "already" ? "déjà présent sur" : "copié sur";
+    const lst = b.listing_added ? `, ajouté à ${String(b.listing).split("/").pop()}`
+      : String(b.listing).startsWith("ÉCHEC") ? `\n⚠️ listing non mis à jour : ${b.listing}` : "";
+    return `💾 ${how} le disque ${b.disk} (${formatSize(b.size)}${b.seconds ? `, ${b.seconds} s` : ""})${lst}\n`;
+  }
+
+  // Question posée par le serveur pendant la sauvegarde (numéro du disque,
+  // disque plein…). Popup non bloquante : si la réponse est donnée depuis la
+  // page /jobs, elle se ferme d'elle-même.
+  function openQuestion(job, handle) {
+    const q = job.question;
+    const post = (body) =>
+      nettoyarrRequest("POST", `/job/answer?id=${encodeURIComponent(job.id)}&q=${encodeURIComponent(q.id)}`,
+        { body: JSON.stringify(body) });
+    if (q.type === "identify") {
+      askModal(
+        `${job.name}\n\nDisque d'archive non identifié branché sur ${q.path} (${formatSize(q.free)} libres sur ${formatSize(q.total)}).\n\n` +
+        "Quel est son numéro ? Un fichier repère sera créé à sa racine, et la release ajoutée au listing " +
+        "disqueN….txt correspondant (créé s'il n'existe pas)." + (q.note ? `\n\n❌ ${q.note}` : ""),
+        { handle, input: { label: "Disque n°", value: q.suggested },
+          buttons: [{ label: "Ne pas supprimer", value: "abort" }, { label: "Identifier et sauvegarder", value: "identify", primary: true }] }
+      ).then((a) => { if (a.value) post({ choice: a.value, disk: a.text }); });
+      return;
+    }
+    const msg = q.type === "disk"
+      ? `${job.name}\n\nAucun disque d'archive branché avec assez de place (${formatSize(q.size)} nécessaires).\n\n` +
+        (q.disks || []).map((x) => `• ${x.path} : ${x.usable ? `disque ${x.disk || "?"}, ${formatSize(x.free)} libres` : x.reason}`).join("\n") +
+        "\n\nBranche un disque dans le dock, puis réessaie."
+      : `${job.name}\n\n❌ Sauvegarde impossible :\n${q.error}\n\nLe torrent n'a pas été supprimé.`;
+    askModal(msg, { handle, buttons: [
+      { label: "Ne pas supprimer", value: "abort" },
+      { label: "Supprimer sans sauvegarder", value: "skip" },
+      { label: "Réessayer", value: "retry", primary: true }] }
+    ).then((a) => { if (a.value) post({ choice: a.value }); });
+  }
+
+  // Suit une sélection traitée par le serveur (file d'attente). Renvoie la
+  // liste des hardlinks à proposer, ou null si l'utilisateur est passé sur
+  // la page séparée.
+  async function followBatch(batch, hashes, ui) {
+    const reported = new Set();
+    const pendingLinks = [];
+    let detached = false, question = null, failures = 0;
+    ui.onCancel(() => nettoyarrRequest("POST", `/job/cancel?batch=${encodeURIComponent(batch)}`));
+    ui.onDetach(() => {
+      detached = true;
+      if (question) question.handle.close();
+      window.open(`${getConfig().nettoyarrUrl}/jobs?batch=${encodeURIComponent(batch)}`, "_blank");
+      ui.close();
+    });
+    for (;;) {
+      if (detached) return null;
+      const r = await nettoyarrGet(`/jobs.json?batch=${encodeURIComponent(batch)}`, { timeout: 10000 });
+      if (detached) return null;
+      if (r.status !== 200 || !r.data || !r.data.jobs) {
+        if (++failures >= MAX_POLL_FAILURES) {
+          ui.addResult(`❌ Suivi interrompu (${r.raw || "HTTP " + r.status}) — la suite continue côté serveur : ${getConfig().nettoyarrUrl}/jobs`);
+          return pendingLinks;
+        }
+        ui.setStep(`Connexion à nettoyarr perdue, nouvel essai (${failures}/${MAX_POLL_FAILURES})…`);
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+      failures = 0;
+      const jobs = r.data.jobs;
+      for (const j of jobs) {
+        if (j.state !== "done" || reported.has(j.id)) continue;
+        reported.add(j.id);
+        ui.addResult(formatResult({ status: 200, data: j.result }, j.name));
+        const links = j.result && j.result.links;
+        if (j.links_pending && links && links.deletable && links.deletable.length) {
+          pendingLinks.push({ jobId: j.id, name: j.name, links: links.deletable });
+        }
+      }
+      ui.setCancellable(jobs.some((j) => j.cancellable));
+      const idx = jobs.findIndex((j) => j.state !== "done");
+      const cur = jobs[idx];
+      const qid = cur && cur.state === "waiting" && cur.question ? cur.question.id : null;
+      if (question && question.id !== qid) { question.handle.close(); question = null; }
+      if (!cur) return pendingLinks;
+      ui.setTorrent(idx + 1, cur.name);
+      if (qid) {
+        ui.setStep("En attente de ta réponse…");
+        if (!question) {
+          question = { id: qid, handle: {} };
+          openQuestion(cur, question.handle);
+        }
+      } else {
+        ui.setStep(cur.step, cur.current, cur.total, cur.idle, cur.unit);
+      }
+      await sleep(POLL_INTERVAL_MS);
+    }
+  }
 
   // Bilan des autres hardlinks : ce qui retient encore l'espace disque une
   // fois le torrent supprimé (film, épisodes ou orphelin).
@@ -421,6 +533,14 @@
 
   function formatResult(r, name) {
     const d = r.data;
+    const line = formatResultCore(r, name);
+    return (d ? formatBackup(d.backup) : "") + line;
+  }
+
+  function formatResultCore(r, name) {
+    const d = r.data;
+    if (d && d.kind === "cancelled") return `⏹ ${name} : ${d.error}`;
+    if (d && d.kind === "skipped") return `⏭️ ${name} : ${d.error}`;
     if (d && d.ok) {
       const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent${d.torrents > 1 ? "s" : ""} qBit)` : "";
       if (d.kind === "movie") {
@@ -507,28 +627,38 @@
         ? names[hashes[0]] || hashes[0]
         : hashes.map((h) => names[h] || h.slice(0, 8)).join("\n");
 
-    const confirmed = await nettoyarrConfirm(
-      `Supprimer définitivement :\n${label}\n\n(fichiers, qBittorrent, Radarr/Sonarr, et Seerr pour les films)`
-    );
-    if (!confirmed) return;
-
-    // Traitement SÉQUENTIEL (plus de Promise.all) : deux torrents d'une même
-    // saison (doublons cross-seed) ne se font plus concurrence, et le second
-    // est simplement signalé comme déjà nettoyé.
-    const ui = createProgressModal(hashes.length);
-    const pendingLinks = []; // hardlinks restants, supprimés seulement après confirmation
-    for (let i = 0; i < hashes.length; i++) {
-      const hash = hashes[i];
-      const name = names[hash] || hash.slice(0, 8);
-      ui.setTorrent(i + 1, name);
-      ui.setStep("Démarrage…");
-      const result = await runDelete(hash, ui);
-      ui.addResult(formatResult(result, name));
-      const links = result.data && result.data.links;
-      if (result.jobId && links && links.deletable && links.deletable.length) {
-        pendingLinks.push({ jobId: result.jobId, name, links: links.deletable });
-      }
+    const canBackup = await backupEnabled();
+    // Releases déjà présentes dans un listing de disque d'archive : signalées
+    // ici, et jamais recopiées même si la case est cochée.
+    let saved = "";
+    if (canBackup) {
+      const chk = await nettoyarrRequest("POST", "/backup/check", { body: JSON.stringify({ hashes }) });
+      const found = (chk.data && chk.data.found) || {};
+      const lines = hashes.filter((h) => found[h]).map((h) =>
+        `• ${names[h] || h.slice(0, 8)} → disque ${found[h].disks.join(", ")}`);
+      if (lines.length) saved = `\n\n💾 Déjà sauvegardé (ne sera pas recopié) :\n${lines.join("\n")}`;
     }
+    const confirm = await askModal(
+      `Supprimer définitivement :\n${label}\n\n(fichiers, qBittorrent, Radarr/Sonarr, et Seerr pour les films)${saved}`,
+      { check: canBackup ? { label: "💾 Sauvegarder d'abord sur un disque d'archive (dock)" } : null,
+        buttons: [{ label: "Annuler", value: false }, { label: "OK", value: true, primary: true }] }
+    );
+    if (!confirm.value) return;
+    const withBackup = confirm.checked;
+
+    // Toute la sélection est confiée au serveur, qui la traite dans l'ordre
+    // (sauvegarde puis suppression, torrent après torrent) : fermer l'onglet
+    // ou passer sur la page séparée n'interrompt rien.
+    const start = await nettoyarrRequest("POST", "/batch", {
+      body: JSON.stringify({ hashes, names, backup: withBackup }),
+    });
+    if (!(start.data && start.data.batch)) {
+      await nettoyarrAlert("❌ " + ((start.data && start.data.error) || start.raw || `HTTP ${start.status}`));
+      return;
+    }
+    const ui = createProgressModal(hashes.length);
+    const pendingLinks = await followBatch(start.data.batch, hashes, ui);
+    if (pendingLinks === null) return; // suivi poursuivi sur la page /jobs
     await ui.finish();
     if (pendingLinks.length) await confirmLinks(pendingLinks);
   }
