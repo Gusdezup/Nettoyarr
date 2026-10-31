@@ -5,6 +5,20 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.8.1] - 2026-10-31
+
+### Added
+- **Sauvegarde seule, sans suppression** : nouvelle entrée « 💾 Nettoyarr — Sauvegarder sur disque d'archive » dans le menu contextuel de qBittorrent (sélection multiple), et bouton « 💾 Sauvegarder la sélection » dans l'explorateur. Même mécanique que la sauvegarde préalable (file d'attente côté serveur, page `/jobs`, Annuler, disque à identifier ou plein), sans l'étape de suppression ; les releases déjà présentes dans un listing sont ignorées.
+- Explorateur : **colonne « Archivé »** (« 💾 N » quand la release figure dans le listing du disque N, triable) et **règle « Sauvegardé sur disque d'archive : oui / non »**. Les listings sont relus à chaque ouverture de l'explorateur : une modification à la main est prise en compte sans actualiser l'inventaire.
+- Liens vers la page `/jobs` depuis l'explorateur et `/config`.
+
+### Changed
+- Sauvegarde désactivée : ni colonne, ni bouton, ni critère, ni entrée de menu, et aucun listing n'est lu ; une règle « Sauvegardé » enregistrée auparavant est ignorée. Un listing illisible n'empêche pas l'explorateur de s'afficher.
+- `/batch` accepte `"mode": "backup"` (sauvegarde seule) ; les questions de sauvegarde portent `mode`, et n'y proposent alors que « Abandonner » ou « Réessayer ».
+
+### Fixed
+- Page `/jobs` : une tâche terminée depuis plus d'une heure (oubliée par le serveur) restait affichée alors que le compteur indiquait « 0/0 » et « Aucune tâche récente ».
+
 ## [0.8.0] - 2026-10-31
 
 ### Added

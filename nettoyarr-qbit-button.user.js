@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.8.0
+// @version      0.8.1
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // ⚠️ NE PAS ÉDITER @match ICI : déclare l'adresse de ton qBittorrent dans les
 // réglages du script de l'extension, qui survivent aux mises à jour :
@@ -58,6 +58,7 @@
 
   const MENU_ID = "torrentsTableMenu";
   const ITEM_ID = "nettoyarrMenuItem";
+  const BACKUP_ITEM_ID = "nettoyarrBackupMenuItem";
 
   const POLL_INTERVAL_MS = 1000; // fréquence de suivi du job côté serveur
   const MAX_POLL_FAILURES = 10;  // ~10 s sans pouvoir joindre nettoyarr → abandon du suivi
@@ -410,6 +411,7 @@
     if (!b) return "";
     if (b.kind === "skipped_backup") return "⚠️ supprimé sans sauvegarde (choix manuel)\n";
     if (b.kind === "listed") return `💾 déjà sauvegardé sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+    if (b.kind === "gone") return "ℹ️ déjà absent de qBittorrent, rien à sauvegarder\n";
     if (!b.ok) return "";
     const how = b.kind === "already" ? "déjà présent sur" : "copié sur";
     const lst = b.listing_added ? `, ajouté à ${String(b.listing).split("/").pop()}`
@@ -431,7 +433,8 @@
         "Quel est son numéro ? Un fichier repère sera créé à sa racine, et la release ajoutée au listing " +
         "disqueN….txt correspondant (créé s'il n'existe pas)." + (q.note ? `\n\n❌ ${q.note}` : ""),
         { handle, input: { label: "Disque n°", value: q.suggested },
-          buttons: [{ label: "Ne pas supprimer", value: "abort" }, { label: "Identifier et sauvegarder", value: "identify", primary: true }] }
+          buttons: [{ label: q.mode === "backup" ? "Abandonner" : "Ne pas supprimer", value: "abort" },
+                    { label: "Identifier et sauvegarder", value: "identify", primary: true }] }
       ).then((a) => { if (a.value) post({ choice: a.value, disk: a.text }); });
       return;
     }
@@ -440,10 +443,11 @@
         (q.disks || []).map((x) => `• ${x.path} : ${x.usable ? `disque ${x.disk || "?"}, ${formatSize(x.free)} libres` : x.reason}`).join("\n") +
         "\n\nBranche un disque dans le dock, puis réessaie."
       : `${job.name}\n\n❌ Sauvegarde impossible :\n${q.error}\n\nLe torrent n'a pas été supprimé.`;
-    askModal(msg, { handle, buttons: [
-      { label: "Ne pas supprimer", value: "abort" },
-      { label: "Supprimer sans sauvegarder", value: "skip" },
-      { label: "Réessayer", value: "retry", primary: true }] }
+    askModal(msg, { handle, buttons: q.mode === "backup"
+      ? [{ label: "Abandonner", value: "abort" }, { label: "Réessayer", value: "retry", primary: true }]
+      : [{ label: "Ne pas supprimer", value: "abort" },
+         { label: "Supprimer sans sauvegarder", value: "skip" },
+         { label: "Réessayer", value: "retry", primary: true }] }
     ).then((a) => { if (a.value) post({ choice: a.value }); });
   }
 
@@ -540,6 +544,7 @@
   function formatResultCore(r, name) {
     const d = r.data;
     if (d && d.kind === "cancelled") return `⏹ ${name} : ${d.error}`;
+    if (d && d.ok && d.kind === "backup") return `${name} : sauvegarde seule, rien n'a été supprimé`;
     if (d && d.kind === "skipped") return `⏭️ ${name} : ${d.error}`;
     if (d && d.ok) {
       const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent${d.torrents > 1 ? "s" : ""} qBit)` : "";
@@ -598,6 +603,55 @@
       for (const k of d.dirs_kept || []) lines.push(`   📁 dossier conservé, contient encore : ${k.left.join(", ")} (${k.path})`);
     }
     await nettoyarrAlert(lines.join("\n"));
+  }
+
+  // Torrents sélectionnés dans qBittorrent, ou null (message déjà affiché).
+  async function selectedTorrents() {
+    const table = unsafeWindow.torrentsTable;
+    if (!table || typeof table.selectedRowsIds !== "function") {
+      await nettoyarrAlert(
+        "Impossible d'accéder à torrentsTable (page qBittorrent) — " +
+        "le script a peut-être besoin d'une mise à jour si la WebUI a changé."
+      );
+      return null;
+    }
+    const hashes = table.selectedRowsIds();
+    if (!hashes || hashes.length === 0) {
+      await nettoyarrAlert("Aucun torrent sélectionné.");
+      return null;
+    }
+    return { hashes, names: await getTorrentNames(hashes) };
+  }
+
+  // Sauvegarde seule sur disque d'archive : rien n'est supprimé.
+  async function onBackupClick(e) {
+    e.preventDefault();
+    const sel = await selectedTorrents();
+    if (!sel) return;
+    const { hashes, names } = sel;
+    const chk = await nettoyarrRequest("POST", "/backup/check", { body: JSON.stringify({ hashes }) });
+    const found = (chk.data && chk.data.found) || {};
+    const todo = hashes.filter((h) => !found[h]);
+    const listed = hashes.filter((h) => found[h]).map((h) => `• ${names[h] || h.slice(0, 8)} → disque ${found[h].disks.join(", ")}`);
+    const saved = listed.length ? `\n\n💾 Déjà sauvegardé (ignoré) :\n${listed.join("\n")}` : "";
+    if (!todo.length) {
+      await nettoyarrAlert(`Rien à sauvegarder : tout est déjà dans un listing de disque d'archive.${saved}`);
+      return;
+    }
+    const go = await askModal(
+      `Sauvegarder sur un disque d'archive :\n${todo.map((h) => names[h] || h.slice(0, 8)).join("\n")}${saved}\n\nRien n'est supprimé.`,
+      { buttons: [{ label: "Annuler", value: false }, { label: "Sauvegarder", value: true, primary: true }] });
+    if (!go.value) return;
+    const start = await nettoyarrRequest("POST", "/batch", {
+      body: JSON.stringify({ hashes: todo, names, mode: "backup" }),
+    });
+    if (!(start.data && start.data.batch)) {
+      await nettoyarrAlert("❌ " + ((start.data && start.data.error) || start.raw || `HTTP ${start.status}`));
+      return;
+    }
+    const ui = createProgressModal(todo.length);
+    if ((await followBatch(start.data.batch, todo, ui)) === null) return;
+    await ui.finish();
   }
 
   async function onNettoyarrClick(e) {
@@ -673,8 +727,20 @@
       <img src="images/edit-clear.svg" alt="Nettoyarr"> 🧹 Nettoyarr — Supprimer partout
     </a>`;
     menu.appendChild(li);
-
     document.getElementById(ITEM_ID).addEventListener("click", onNettoyarrClick);
+
+    // Entrée « Sauvegarder » : ajoutée seulement si la sauvegarde sur disque
+    // externe est activée côté Nettoyarr (sinon, ou si Nettoyarr ne répond
+    // pas, le menu reste comme avant).
+    backupEnabled().then((on) => {
+      if (!on || document.getElementById(BACKUP_ITEM_ID)) return;
+      const li2 = document.createElement("li");
+      li2.innerHTML = `<a href="#nettoyarr-backup" id="${BACKUP_ITEM_ID}">
+        <img src="images/edit-copy.svg" alt="Sauvegarder"> 💾 Nettoyarr — Sauvegarder sur disque d'archive
+      </a>`;
+      menu.appendChild(li2);
+      document.getElementById(BACKUP_ITEM_ID).addEventListener("click", onBackupClick);
+    });
     return true;
   }
 

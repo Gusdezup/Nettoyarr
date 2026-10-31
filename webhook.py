@@ -1506,8 +1506,10 @@ class JobCancelled(Exception):
 
 
 class Job:
-    def __init__(self, torrent_hash, with_links=True, backup=False, name="", batch=None):
+    def __init__(self, torrent_hash, with_links=True, backup=False, name="", batch=None, mode="delete"):
         self.id = uuid.uuid4().hex[:12]
+        self.mode = mode            # "delete" (avec sauvegarde préalable éventuelle) ou "backup" (sauvegarde seule)
+        backup = backup or mode == "backup"
         self.hash = torrent_hash
         self.with_links = with_links
         self.backup = backup        # sauvegarde préalable sur disque externe
@@ -1556,7 +1558,7 @@ class Job:
     def ask(self, question):
         """Met le job en attente d'une réponse (userscript ou page /jobs)."""
         self.answer, self.answer_event = None, threading.Event()
-        self.question = dict(question, id=uuid.uuid4().hex[:8])
+        self.question = dict(question, id=uuid.uuid4().hex[:8], mode=self.mode)
         self.state = "waiting"
         self.update("En attente de ta réponse…")
         self.answer_event.wait()
@@ -1580,7 +1582,7 @@ class Job:
             percent = max(0, min(100, round(100 * (self.current or 0) / self.total)))
         return {
             "ok": True, "id": self.id, "hash": self.hash, "name": self.name, "batch": self.batch,
-            "state": self.state, "phase": self.phase, "backup": self.backup,
+            "state": self.state, "phase": self.phase, "backup": self.backup, "mode": self.mode,
             "step": self.step, "current": self.current, "total": self.total,
             "percent": percent, "unit": self.unit,
             "question": self.question, "cancellable": self.cancellable,
@@ -1606,8 +1608,8 @@ def _jobs_purge():
         JOBS.pop(jid, None)
 
 
-def create_delete_job(torrent_hash, with_links=True, backup=False, name="", batch=None):
-    job = Job(torrent_hash, with_links, backup=backup, name=name, batch=batch)
+def create_delete_job(torrent_hash, with_links=True, backup=False, name="", batch=None, mode="delete"):
+    job = Job(torrent_hash, with_links, backup=backup, name=name, batch=batch, mode=mode)
     with JOBS_LOCK:
         _jobs_purge()
         JOBS[job.id] = job
@@ -1638,8 +1640,15 @@ def jobs_list(batch=None):
     return sorted((j.to_dict() for j in jobs), key=lambda d: d["created"])
 
 
-def _cancelled_result():
-    return 200, {"ok": False, "kind": "cancelled", "error": "annulé : rien n'a été supprimé"}
+def _cancelled_result(job=None):
+    what = "copié" if job is not None and job.mode == "backup" else "supprimé"
+    return 200, {"ok": False, "kind": "cancelled", "error": f"annulé : rien n'a été {what}"}
+
+
+def _skipped_result(job):
+    if job.mode == "backup":
+        return 200, {"ok": False, "kind": "skipped", "error": "abandonné : rien n'a été copié"}
+    return 200, {"ok": False, "kind": "skipped", "error": "non supprimé (pas de sauvegarde)"}
 
 
 def run_job_backup(job):
@@ -1660,7 +1669,7 @@ def run_job_backup(job):
             ans = job.ask({"type": "identify", "path": payload["path"], "free": payload["free"],
                            "total": payload["total"], "suggested": payload["suggested"], "note": note})
             if ans.get("choice") != "identify":
-                return 200, {"ok": False, "kind": "skipped", "error": "non supprimé (pas de sauvegarde)"}
+                return _skipped_result(job)
             try:
                 number = int(ans.get("disk"))
             except (TypeError, ValueError):
@@ -1674,16 +1683,16 @@ def run_job_backup(job):
         choice = ans.get("choice")
         if choice == "retry":
             continue
-        if choice == "skip":
+        if choice == "skip" and job.mode != "backup":
             job.backup_result = {"ok": False, "kind": "skipped_backup"}
             return None
-        return 200, {"ok": False, "kind": "skipped", "error": "non supprimé (pas de sauvegarde)"}
+        return _skipped_result(job)
 
 
 def run_delete_job(job):
     job.backup_result = None
     if job.cancel_event.is_set():
-        job.finish(*_cancelled_result())
+        job.finish(*_cancelled_result(job))
         return
     job.state = "running"
     if job.backup:
@@ -1691,13 +1700,17 @@ def run_delete_job(job):
             stop = run_job_backup(job)
         except JobCancelled:
             log.info(f"Job {job.id} ({job.name}) : annulé pendant la sauvegarde")
-            job.finish(*_cancelled_result())
+            job.finish(*_cancelled_result(job))
             return
         if stop:
             job.finish(*stop)
             return
+        if job.mode == "backup":  # sauvegarde seule : rien n'est supprimé
+            log.info(f"Sauvegarde seule ({job.name}) : {job.backup_result}")
+            job.finish(200, {"ok": True, "kind": "backup", "backup": job.backup_result})
+            return
         if job.cancel_event.is_set():
-            job.finish(*_cancelled_result())
+            job.finish(*_cancelled_result(job))
             return
     job.phase = "delete"  # à partir d'ici, plus d'annulation possible
     job.unit = None
@@ -3365,6 +3378,25 @@ def start_inventory_job():
     return job
 
 
+def inventory_with_saved(releases):
+    """Ajoute à chaque release « saved » : n° des disques d'archive dont un
+    listing la mentionne (liste vide sinon). Relu à chaque ouverture de
+    l'explorateur (quelques dizaines de Ko de texte) : un listing modifié à la
+    main est pris en compte sans reconstruire l'inventaire. En cas de
+    problème, l'inventaire est renvoyé tel quel, sans cette information."""
+    try:
+        index = backup_listings_index()
+        out = []
+        for r in releases:
+            names = [r.get("name", "")] + [t.get("name", "") for t in r.get("trackers", [])]
+            disks = sorted({d for n in names for d, _ in index.get(_release_key(n), [])})
+            out.append(dict(r, saved=disks))
+        return out
+    except Exception as e:
+        log.warning(f"Explorateur : listings des disques d'archive illisibles ({e})")
+        return releases
+
+
 def inventory_status():
     job, data = INVENTORY["job"], INVENTORY["data"]
     if job and job.state != "done":
@@ -3372,6 +3404,8 @@ def inventory_status():
     if data:
         out = {"state": "ready", "dry_run": DRY_RUN, "backup_enabled": BACKUP_ENABLED,
                "tracker_names": TRACKER_NAMES, **data}
+        if BACKUP_ENABLED and BACKUP_LISTING_DIR:
+            out["releases"] = inventory_with_saved(data.get("releases") or [])
         if job and job.result and not job.result.get("ok"):
             out["last_error"] = job.result.get("error")
         return out
@@ -3541,6 +3575,7 @@ EXPLORER_HTML = r"""<!DOCTYPE html>
     <th data-k="seeds">Trackers (seeders)</th>
     <th data-k="imported">Importé</th>
     <th data-k="last_played">Vu le</th>
+    <th data-k="saved" id="th-saved" title="Disque(s) d'archive dont le listing mentionne la release" hidden>Archivé</th>
   </tr></thead>
   <tbody id="rows"></tbody>
 </table>
@@ -3549,6 +3584,7 @@ EXPLORER_HTML = r"""<!DOCTYPE html>
 
 <footer>
   <span id="selinfo">Aucune release cochée</span>
+  <button id="backup" disabled hidden>💾 Sauvegarder la sélection</button>
   <button class="primary" id="delete" disabled>🧹 Supprimer la sélection</button>
 </footer>
 
@@ -3672,8 +3708,9 @@ const OPS = {
   num:     [["gt", "supérieur à"], ["lt", "inférieur à"]],
   date:    [["before", "avant le"], ["after", "après le"]],
   played:  [["before", "avant le"], ["after", "après le"], ["never", "jamais vu"], ["unknown", "absent de Plex"]],
+  saved:   [["yes", "oui"], ["no", "non"]],
 };
-const VALUELESS = new Set(["never", "unknown"]);
+const VALUELESS = new Set(["never", "unknown", "yes", "no"]);
 const FIELDS = {
   q:         { label: "Texte (partout)", type: "text", ph: "titre, release, tracker, catégorie, dossier…" },
   title:     { label: "Titre", type: "text" },
@@ -3690,7 +3727,10 @@ const FIELDS = {
   ntrackers: { label: "Nombre de trackers", type: "num", step: "1" },
   imported:  { label: "Importé", type: "date" },
   played:    { label: "Dernier visionnage", type: "played" },
+  saved:     { label: "Sauvegardé sur disque d'archive", type: "saved" },
 };
+// Critère proposé seulement si la sauvegarde sur disque externe est activée.
+const fieldAvailable = (k) => k !== "saved" || !!(DATA && DATA.backup_enabled);
 
 let RULES = { match: "all", rules: [] };
 const dateTs = (v) => (v ? Date.parse(v + "T00:00:00") / 1000 : null);
@@ -3782,6 +3822,10 @@ function testRule(r, x) {
     const known = (t) => typeof t.seeds === "number";
     if (f === "seeds_all") return r.trackers.length > 0 && r.trackers.every((t) => known(t) && cmp(t.seeds));
     return r.trackers.some((t) => known(t) && cmp(t.seeds));
+  }
+  if (type === "saved") {
+    if (!Array.isArray(r.saved)) return null; // fonction désactivée : règle ignorée
+    return op === "yes" ? r.saved.length > 0 : r.saved.length === 0;
   }
   if (type === "date" || type === "played") {
     const lp = type === "played" ? r.last_played : r.imported;
@@ -3899,7 +3943,7 @@ function ruleEl(x, g) {
   if (!OPS[def.type].some(([k]) => k === x.op)) x.op = OPS[def.type][0][0];
 
   const fSel = el("select", { class: "f", "aria-label": "Critère" },
-    ...Object.entries(FIELDS).map(([k, d]) => el("option", { value: k, text: d.label })));
+    ...Object.entries(FIELDS).filter(([k]) => k === x.f || fieldAvailable(k)).map(([k, d]) => el("option", { value: k, text: d.label })));
   fSel.value = x.f;
   fSel.onchange = () => { Object.assign(x, newRule(fSel.value)); changed(true); };
 
@@ -3949,6 +3993,7 @@ function sortValue(r, k) {
   if (k === "seeds") return minSeeds(r);
   if (k === "last_played") return r.last_played === null ? -1 : r.last_played;
   if (k === "imported") return r.imported || 0;
+  if (k === "saved") return r.saved && r.saved.length ? Math.min(...r.saved) : 1e9;
   if (k === "title" || k === "kind") return String(r[k]).toLowerCase();
   return r[k];
 }
@@ -4001,6 +4046,8 @@ function render() {
       chips,
       el("td", { class: "num", title: r.imported_src === "qbit" ? "Date d'ajout dans qBittorrent (aucun *arr)" : "", text: r.imported ? fmtDate(r.imported) + (r.imported_src === "qbit" ? "*" : "") : "—" }),
       el("td", { class: "num", title: playedTitle, text: played }),
+      DATA.backup_enabled ? el("td", { class: "num", title: r.saved && r.saved.length ? "Mentionnée dans le listing du disque " + r.saved.join(", ") : "Dans aucun listing",
+        text: r.saved && r.saved.length ? "💾 " + r.saved.join(", ") : "—" }) : null,
     );
     frag.append(tr);
   }
@@ -4016,6 +4063,9 @@ function render() {
   const selSize = sel.reduce((a, r) => a + r.size, 0);
   $("selinfo").textContent = sel.length ? `${sel.length} release(s) cochée(s) — ${fmtSize(selSize)}` : "Aucune release cochée";
   $("delete").disabled = BUSY || !sel.length;
+  $("backup").hidden = !(DATA && DATA.backup_enabled);
+  $("backup").disabled = BUSY || !sel.length;
+  $("th-saved").hidden = !(DATA && DATA.backup_enabled);
   for (const th of document.querySelectorAll("th[data-k]")) {
     th.textContent = th.textContent.replace(/ [▲▼]$/, "") + (th.dataset.k === SORT.k ? (SORT.dir > 0 ? " ▲" : " ▼") : "");
   }
@@ -4082,7 +4132,8 @@ async function answerQuestion(job) {
       "Quel est son numéro ? Un fichier repère sera créé à sa racine, et la release ajoutée au listing disqueN….txt " +
       "correspondant (créé s'il n'existe pas)." + (q.note ? `\n\n❌ ${q.note}` : ""),
       { input: { label: "Disque n°", value: q.suggested },
-        buttons: [{ label: "Ne pas supprimer", value: "abort" }, { label: "Identifier et sauvegarder", value: "identify", primary: true }] });
+        buttons: [{ label: q.mode === "backup" ? "Abandonner" : "Ne pas supprimer", value: "abort" },
+                  { label: "Identifier et sauvegarder", value: "identify", primary: true }] });
     body = { choice: a.value, disk: a.text };
   } else {
     const msg = q.type === "disk"
@@ -4090,10 +4141,11 @@ async function answerQuestion(job) {
         (q.disks || []).map((x) => `• ${x.path} : ${x.usable ? `disque ${x.disk || "?"}, ${fmtSize(x.free)} libres` : x.reason}`).join("\n") +
         "\n\nBranche un disque dans le dock, puis réessaie."
       : `${job.name}\n\n❌ Sauvegarde impossible :\n${q.error}\n\nLa release n'a pas été supprimée.`;
-    const a = await ask(msg, { buttons: [
-      { label: "Ne pas supprimer", value: "abort" },
-      { label: "Supprimer sans sauvegarder", value: "skip" },
-      { label: "Réessayer", value: "retry", primary: true }] });
+    const a = await ask(msg, { buttons: q.mode === "backup"
+      ? [{ label: "Abandonner", value: "abort" }, { label: "Réessayer", value: "retry", primary: true }]
+      : [{ label: "Ne pas supprimer", value: "abort" },
+         { label: "Supprimer sans sauvegarder", value: "skip" },
+         { label: "Réessayer", value: "retry", primary: true }] });
     body = { choice: a.value };
   }
   await api(`/job/answer?id=${encodeURIComponent(job.id)}&q=${encodeURIComponent(q.id)}`, { method: "POST", body: JSON.stringify(body) });
@@ -4103,6 +4155,7 @@ function formatBackup(b) {
   if (!b) return "";
   if (b.kind === "skipped_backup") return "⚠️ supprimée sans sauvegarde (choix manuel)\n";
   if (b.kind === "listed") return `💾 déjà sauvegardée sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+  if (b.kind === "gone") return "ℹ️ déjà absente de qBittorrent, rien à sauvegarder\n";
   if (!b.ok) return "";
   const how = b.kind === "already" ? "déjà présente sur" : "copiée sur";
   const lst = b.listing_added ? `, ajoutée à ${String(b.listing).split("/").pop()}`
@@ -4261,6 +4314,76 @@ async function deleteSelected() {
   await modal(recap, { cancel: false });
 }
 
+// ── Sauvegarde seule (rien n'est supprimé) ─────────────────────────────
+// Toute la sélection est confiée au serveur (/batch, mode "backup") : la
+// suite continue même page fermée, et se suit aussi sur /jobs.
+async function backupSelected() {
+  const rels = DATA.releases.filter((r) => SELECTED.has(r.id) && !DONE.has(r.id));
+  if (!rels.length) return;
+  const todo = rels.filter((r) => !(r.saved && r.saved.length));
+  const known = rels.length - todo.length;
+  const total = todo.reduce((a, r) => a + r.size, 0);
+  const shown = todo.slice(0, 15).map((r) => `• ${r.title} (${fmtSize(r.size)})`).join("\n");
+  if (!todo.length) {
+    await modal(`Les ${rels.length} release(s) cochée(s) sont déjà dans un listing de disque d'archive : rien à sauvegarder.`, { cancel: false });
+    return;
+  }
+  const go = await ask(
+    `Sauvegarder sur un disque d'archive ${todo.length} release(s), ${fmtSize(total)} :\n\n${shown}` +
+    (todo.length > 15 ? `\n… +${todo.length - 15} autre(s)` : "") +
+    (known ? `\n\n💾 ${known} autre(s) déjà dans un listing : ignorée(s).` : "") +
+    "\n\nRien n'est supprimé.",
+    { buttons: [{ label: "Annuler", value: false }, { label: "Sauvegarder", value: true, primary: true }] });
+  if (!go.value) return;
+
+  const names = Object.fromEntries(todo.map((r) => [r.hashes[0], r.title]));
+  const start = await api("/batch", { method: "POST",
+    body: JSON.stringify({ hashes: todo.map((r) => r.hashes[0]), names, mode: "backup" }) });
+  const batch = start.data && start.data.batch;
+  if (!batch) {
+    await modal("❌ " + ((start.data && start.data.error) || `HTTP ${start.status}`), { cancel: false });
+    return;
+  }
+  BUSY = true; render();
+  $("log").textContent = "";
+  logLine(`Suivi aussi sur la page Tâches : /jobs?batch=${batch}`);
+  const reported = new Set(), asked = new Set();
+  let jobs = [], failures = 0;
+  for (;;) {
+    const r = await api(`/jobs.json?batch=${encodeURIComponent(batch)}`);
+    if (!(r.data && r.data.jobs)) {
+      if (++failures >= 10) { logLine("❌ Suivi interrompu : la sauvegarde continue côté serveur (voir /jobs)."); break; }
+      await sleep(1000);
+      continue;
+    }
+    failures = 0;
+    jobs = r.data.jobs;
+    for (const j of jobs) {
+      if (j.state !== "done" || reported.has(j.id)) continue;
+      reported.add(j.id);
+      const d = j.result || {};
+      logLine(d.ok ? `${formatBackup(d.backup).trim()} — ${j.name}` : `⏭️ ${j.name} : ${d.error || "erreur inconnue"}`);
+    }
+    const i = jobs.findIndex((j) => j.state !== "done");
+    if (i < 0) break;
+    const cur = jobs[i];
+    const prefix = `${i + 1}/${jobs.length} — ${cur.name} : `;
+    if (cur.state === "waiting" && cur.question && !asked.has(cur.question.id)) {
+      asked.add(cur.question.id);
+      setStatus(prefix + "en attente de ta réponse…");
+      await answerQuestion(cur);
+      continue;
+    }
+    setStatus(prefix + cur.step, cur.current, cur.total, cur.unit);
+    await sleep(1000);
+  }
+  setStatus("");
+  BUSY = false;
+  const ok = jobs.filter((j) => j.result && j.result.ok).length;
+  await modal(`${ok ? "✅" : "❌"} ${ok}/${jobs.length} release(s) sauvegardée(s) ou déjà présente(s)\n\n${$("log").textContent}`, { cancel: false });
+  return load(false); // colonne « Archivé » à jour (listings relus)
+}
+
 async function confirmLinks(pending) {
   const all = pending.flatMap((p) => p.links);
   const total = all.reduce((a, l) => a + l.size, 0);
@@ -4302,6 +4425,7 @@ $("all").onchange = () => {
 };
 $("refresh").onclick = () => { DONE.clear(); refresh(); };
 $("delete").onclick = deleteSelected;
+$("backup").onclick = backupSelected;
 api("/explorer/criteria").then((r) => {
   RULES = migrate(r.data && typeof r.data === "object" ? r.data : null);
   buildRules();
@@ -4399,6 +4523,7 @@ function formatBackup(b) {
   if (!b) return "";
   if (b.kind === "skipped_backup") return "⚠️ supprimé sans sauvegarde (choix manuel)\n";
   if (b.kind === "listed") return `💾 déjà sauvegardé sur le disque ${b.disk} (${b.listing}), pas de nouvelle copie\n`;
+  if (b.kind === "gone") return "ℹ️ déjà absent de qBittorrent, rien à sauvegarder\n";
   if (!b.ok) return "";
   const how = b.kind === "already" ? "déjà présent sur" : "copié sur";
   const lst = b.listing_added ? `, ajouté à ${String(b.listing).split("/").pop()}`
@@ -4419,6 +4544,7 @@ function formatLinks(l) {
 function formatResult(d) {
   if (!d) return "";
   const backup = formatBackup(d.backup);
+  if (d.ok && d.kind === "backup") return backup.trim() + "\n(sauvegarde seule : rien n'a été supprimé)";
   if (d.ok) {
     const qbit = typeof d.torrents === "number" ? ` (${d.torrents} torrent(s) qBit)` : "";
     if (d.kind === "movie") return `${backup}✅ ${d.title} : supprimé de ${d.targets.join(" / ")}${qbit}${formatLinks(d.links)}`;
@@ -4475,13 +4601,15 @@ function renderQuestion(j) {
     if (q.note) box.append(el("div", { class: "note", text: "\n" + q.note }));
     const input = el("input", { type: "number", min: "1", value: String(q.suggested) });
     box.append(el("div", {}, el("label", { text: "\nDisque n°" }, input)));
-    const no = el("button", { text: "Ne pas supprimer" });
+    const no = el("button", { text: q.mode === "backup" ? "Abandonner" : "Ne pas supprimer" });
     no.onclick = () => answer(j, { choice: "abort" });
     const yes = el("button", { class: "primary", text: "Identifier et sauvegarder" });
     yes.onclick = () => answer(j, { choice: "identify", disk: input.value });
     row.append(no, yes);
   } else {
-    for (const [label, choice, primary] of [["Ne pas supprimer", "abort"], ["Supprimer sans sauvegarder", "skip"], ["Réessayer", "retry", true]]) {
+    const choices = q.mode === "backup" ? [["Abandonner", "abort"], ["Réessayer", "retry", true]]
+      : [["Ne pas supprimer", "abort"], ["Supprimer sans sauvegarder", "skip"], ["Réessayer", "retry", true]];
+    for (const [label, choice, primary] of choices) {
       const b = el("button", { class: primary ? "primary" : "", text: label });
       b.onclick = () => answer(j, { choice });
       row.append(b);
@@ -4885,7 +5013,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(400, {"ok": False, "error": f"Requête invalide : {e}"})
                 return
-            backup = bool(body.get("backup"))
+            mode = "backup" if body.get("mode") == "backup" else "delete"
+            backup = bool(body.get("backup")) or mode == "backup"
             if not hashes:
                 self._send_json(400, {"ok": False, "error": "Aucun torrent"})
                 return
@@ -4895,7 +5024,7 @@ class Handler(BaseHTTPRequestHandler):
             names = body.get("names") if isinstance(body.get("names"), dict) else {}
             batch = uuid.uuid4().hex[:10]
             jobs = [create_delete_job(h, body.get("links", True) is not False, backup=backup,
-                                      name=str(names.get(h) or ""), batch=batch) for h in hashes]
+                                      name=str(names.get(h) or ""), batch=batch, mode=mode) for h in hashes]
             self._send_json(202, {"ok": True, "batch": batch, "jobs": [j.id for j in jobs]})
             return
 

@@ -48,8 +48,9 @@ Nettoyarr fait ce ménage automatiquement, dans les deux sens :
   isolée) : supprimés quand même dans qBittorrent et sur le NAS
 - Bilan des autres hardlinks des fichiers supprimés, proposés à la
   suppression après confirmation, pour libérer réellement l'espace disque
-- Sauvegarde préalable optionnelle de la release sur un disque d'archive
-  (dock USB), avec mise à jour du listing du disque
+- Sauvegarde optionnelle des releases sur un disque d'archive (dock USB),
+  avant suppression ou seule, avec mise à jour du listing du disque et
+  indication « archivé » dans l'explorateur
 - File d'attente côté serveur : une sélection va à son terme même onglet
   fermé, suivie (et annulable) depuis la page `/jobs`
 - Identification rapide depuis qBittorrent : historique Radarr/Sonarr
@@ -170,7 +171,9 @@ Critères disponibles : texte (partout, titre, nom des torrents), tracker
 (en seed sur / pas en seed sur / seulement sur), catégorie qBittorrent,
 instance *arr, type, bibliothèque Plex, dossier, taille, seeders (sur tous
 les trackers ou sur au moins un), nombre de trackers, date d'import,
-dernier visionnage (avant / après / jamais vu / absent de Plex).
+dernier visionnage (avant / après / jamais vu / absent de Plex), et, si la
+[sauvegarde sur disque externe](#sauvegarde-préalable-sur-disque-externe)
+est activée, sauvegardé sur disque d'archive (oui / non).
 
 Une règle sans valeur est ignorée. Les règles sont enregistrées côté
 serveur (`data/explorer.json`) et reprises sur n'importe quel appareil.
@@ -307,6 +310,21 @@ Nettoyarr refuse d'écrire sur la partition système d'un Synology
 (`/dev/md0`, où se trouve le dossier du dock quand aucun disque n'est
 branché), sur le disque des médias ou de `/app/data`, et sur un volume de
 moins de 32 Gio.
+
+### Sauvegarde seule
+
+Pour archiver sans supprimer : entrée **« 💾 Nettoyarr — Sauvegarder sur
+disque d'archive »** du menu clic droit de qBittorrent, ou bouton
+**« 💾 Sauvegarder la sélection »** de l'explorateur. Même fonctionnement
+(file d'attente, `/jobs`, Annuler), sans suppression ; les releases déjà
+listées sont ignorées.
+
+Dans l'explorateur, la colonne **« Archivé »** indique le ou les disques dont
+le listing mentionne la release, et la règle « Sauvegardé sur disque
+d'archive » permet de filtrer ce qui l'est ou non. Les listings sont relus à
+chaque ouverture de l'explorateur.
+
+Sauvegarde désactivée : aucune de ces entrées n'apparaît.
 
 ### Montages
 
