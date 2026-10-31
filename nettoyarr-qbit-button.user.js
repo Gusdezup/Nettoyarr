@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nettoyarr — Supprimer depuis qBittorrent
 // @namespace    nettoyarr
-// @version      0.6.1
+// @version      0.7.0
 // @description  Ajoute une entrée "🧹 Nettoyarr" directement dans le menu contextuel (clic droit) de qBittorrent WebUI, pour supprimer un ou plusieurs torrents (films et/ou séries, y compris packs de saison, sélection multiple) aussi dans Radarr/Sonarr/Seerr via nettoyarr
 // ⚠️ NE PAS ÉDITER @match ICI : déclare l'adresse de ton qBittorrent dans les
 // réglages du script de l'extension, qui survivent aux mises à jour :
@@ -177,12 +177,45 @@
       "font-size:15px;white-space:pre-line;line-height:1.5;margin-top:14px;" +
       "max-height:40vh;overflow-y:auto;overflow-wrap:anywhere;";
 
+    // Arrière-plan : la popup est masquée (qBittorrent redevient utilisable),
+    // le suivi continue et une pastille en bas à droite affiche l'étape ; un
+    // clic dessus rouvre la popup. Elle se rouvre d'elle-même à la fin.
+    const bgRow = document.createElement("div");
+    bgRow.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
+    const bgBtn = makeButton("Continuer en arrière-plan", false);
+    bgRow.appendChild(bgBtn);
+
+    const pill = document.createElement("div");
+    pill.title = "Nettoyarr travaille — clic pour afficher le détail";
+    pill.style.cssText =
+      "position:fixed;right:16px;bottom:16px;z-index:99999;display:none;max-width:420px;" +
+      "background:#22262b;color:#e8e8e8;border:1px solid #c0392b;border-radius:18px;" +
+      "padding:8px 14px;font-family:system-ui,sans-serif;font-size:13px;cursor:pointer;" +
+      "box-shadow:0 4px 14px rgba(0,0,0,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    document.body.appendChild(pill);
+
+    let pillStep = "";
+    const refreshPill = () => {
+      pill.textContent = `🧹 ${pillStep || "Nettoyarr"} · ${elapsedEl.textContent}`;
+    };
+    const showOverlay = () => {
+      pill.style.display = "none";
+      overlay.style.display = "flex";
+    };
+    bgBtn.onclick = () => {
+      overlay.style.display = "none";
+      pill.style.display = "block";
+      refreshPill();
+    };
+    pill.onclick = showOverlay;
+
     const progressBlock = document.createElement("div");
     progressBlock.appendChild(header);
     progressBlock.appendChild(stepEl);
     progressBlock.appendChild(track);
     progressBlock.appendChild(meta);
     progressBlock.appendChild(idleEl);
+    progressBlock.appendChild(bgRow);
 
     box.appendChild(progressBlock);
     box.appendChild(results);
@@ -206,7 +239,10 @@
     }
 
     const t0 = Date.now();
-    const tick = () => (elapsedEl.textContent = "⏱ " + formatElapsed((Date.now() - t0) / 1000));
+    const tick = () => {
+      elapsedEl.textContent = "⏱ " + formatElapsed((Date.now() - t0) / 1000);
+      if (pill.style.display !== "none") refreshPill();
+    };
     tick();
     const timer = setInterval(tick, 250);
     setIndeterminate(true);
@@ -218,6 +254,7 @@
       setStep(text, current, total, idle) {
         const hasCount = typeof total === "number" && total > 0 && typeof current === "number";
         stepEl.textContent = hasCount ? `${text} — ${current}/${total}` : text;
+        pillStep = stepEl.textContent;
         if (hasCount) {
           setIndeterminate(false);
           const pct = Math.max(0, Math.min(100, Math.round((100 * current) / total)));
@@ -239,6 +276,8 @@
       finish() {
         clearInterval(timer);
         setIndeterminate(false);
+        showOverlay(); // résultat (et éventuelle confirmation des hardlinks) toujours affiché
+        pill.remove();
         const total = formatElapsed((Date.now() - t0) / 1000);
         box.removeChild(progressBlock);
         const done = document.createElement("div");

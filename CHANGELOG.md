@@ -5,6 +5,20 @@ Toutes les modifications notables de ce projet seront documentées ici.
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.0.0/),
 et ce projet respecte le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.7.0] - 2026-10-31
+
+### Added
+- `nettoyarr-qbit-button.user.js` : bouton **« Continuer en arrière-plan »** dans la popup de progression. La popup est masquée et qBittorrent redevient utilisable ; une pastille en bas à droite affiche l'étape et le chrono (clic pour rouvrir). La popup réapparaît d'elle-même avec le résultat, et la confirmation des hardlinks éventuelle, à la fin.
+
+### Fixed
+- **Étape « Vérification du nombre de liens restants (inodes) » interminable** (une à plusieurs minutes) après la suppression d'un gros torrent. Le descripteur gardé ouvert sur chaque fichier fait que les blocs ne sont réellement libérés qu'à sa fermeture ; sur btrfs, libérer un gros fichier fragmenté (cas typique d'un torrent) prend du temps, et cette fermeture bloquait le job. Elle se fait désormais en tâche de fond : le résultat arrive tout de suite, l'espace est libéré derrière (journalisé quand ça dure plus de 2 s).
+- **`/delete-links`** : même cause, la suppression du dernier lien d'un gros fichier faisait attendre la réponse. Un descripteur est ouvert avant l'unlink et fermé en tâche de fond.
+- **Coïncidences de taille entre Blu-ray complets.** Deux disques d'un même éditeur partagent souvent un `.m2ts` identique à l'octet près (logo, avertissement, bande-annonce). Un torrent sans rapport était alors signalé « conservé (torrent plus large) » lors d'une suppression d'orphelin, et l'explorateur pouvait fusionner les deux films en une seule release. Deux torrents ne sont plus rapprochés que si leurs fichiers communs pèsent au moins la moitié de l'un des deux ; sinon le rapprochement est ignoré (et journalisé côté suppression).
+- Recherche des fichiers annexes d'une copie hardlinkée : plus jamais récursive depuis un dossier situé juste sous `LINKS_SCAN_ROOT` (ex. une copie posée à plat dans `/media/films` faisait parcourir toute la bibliothèque).
+
+### Changed
+- Logs : durée du relevé des liens restants et du bilan des hardlinks.
+
 ## [0.6.2] - 2026-10-23
 
 ### Security

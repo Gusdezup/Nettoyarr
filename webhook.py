@@ -1816,6 +1816,13 @@ def links_index_loop():
         time.sleep(LINKS_INDEX_UPDATE)
 
 
+def _shared_is_coincidence(shared, total_a, total_b):
+    """Fichiers communs (à l'octet près) qui ne pèsent qu'une petite part des
+    DEUX torrents : pas la même release. Un vrai doublon ou un sous-ensemble
+    fait 100 % du plus petit des deux."""
+    return shared < 0.5 * total_a and shared < 0.5 * total_b
+
+
 def _significant_sizes(sizes):
     """Tailles des « vrais » fichiers (≥ 50 Mo). Repli sur toutes les tailles
     pour un torrent qui n'a que des petits fichiers."""
@@ -1911,7 +1918,10 @@ def _copy_root(path, rels, root):
         tail = list(rel[1:])
         if len(rel) >= 2 and parts[-len(tail):] == tail:
             d = os.sep.join(parts[:-len(tail)]) or os.sep
-            if os.path.commonpath([d, root]) == root and d != root:
+            # Au moins deux niveaux sous la racine : une copie posée à plat
+            # dans /media/films ne doit jamais faire parcourir toute la
+            # bibliothèque à la recherche des fichiers annexes.
+            if os.path.commonpath([d, root]) == root and len(os.path.relpath(d, root).split(os.sep)) >= 2:
                 return d, True
     return os.path.dirname(path), False
 
@@ -1949,14 +1959,41 @@ def _find_companions(ctx, copy_dirs):
     return found
 
 
-def _links_close(ctx):
-    for t in list(ctx["targets"].values()) + list(ctx.get("companions", {}).values()):
-        if t.get("fd") is not None:
+def _close_fds_async(fds, label):
+    """Ferme des descripteurs en tâche de fond. Fermer le DERNIER descripteur
+    d'un fichier déjà délié (plus aucun lien) déclenche la libération réelle
+    de ses blocs : sur btrfs, pour un gros fichier fragmenté (cas typique
+    d'un torrent), ça peut prendre plusieurs minutes et bloquait le job sur
+    « Vérification du nombre de liens restants ». L'espace se libère pareil,
+    simplement sans faire attendre l'utilisateur."""
+    fds = [fd for fd in fds if fd is not None]
+    if not fds:
+        return
+
+    def run():
+        t0 = time.time()
+        for fd in fds:
             try:
-                os.close(t["fd"])
+                os.close(fd)
             except OSError:
                 pass
+        dt = time.time() - t0
+        if dt >= 2:
+            log.info(f"  Libération de l'espace disque ({label}) terminée en {dt:.0f}s, en tâche de fond")
+
+    threading.Thread(target=run, daemon=True, name="nettoyarr-fd-close").start()
+
+
+def _links_close(ctx):
+    """Détache les descripteurs du contexte (un second appel ne refermera
+    donc jamais un numéro de descripteur réutilisé entre-temps), puis les
+    ferme en tâche de fond."""
+    fds = []
+    for t in list(ctx["targets"].values()) + list(ctx.get("companions", {}).values()):
+        if t.get("fd") is not None:
+            fds.append(t["fd"])
             t["fd"] = None
+    _close_fds_async(fds, "fichiers supprimés")
 
 
 def _is_link_of(path, key):
@@ -1992,7 +2029,8 @@ def _links_scan(ctx, step):
     # propres chemins disparaissent, puis on retire du compte ceux qui
     # existent encore (DRY_RUN, ou qBit en retard).
     step("Vérification du nombre de liens restants (inodes)")
-    deadline = time.time() + (0 if DRY_RUN else 10)
+    t_start = time.time()
+    deadline = t_start + (0 if DRY_RUN else 10)
     while True:
         alive = [p for p, k in ctx["own"].items() if _is_link_of(p, k)]
         if not alive or time.time() >= deadline:
@@ -2006,7 +2044,8 @@ def _links_scan(ctx, step):
         t["expected"] = max(0, nlink - own_alive.get(key, 0))
 
     total_expected = sum(t["expected"] for t in targets.values())
-    log.info(f"  Liens restants après suppression : {total_expected} sur {len(targets)} fichier(s)")
+    log.info(f"  Liens restants après suppression : {total_expected} sur {len(targets)} fichier(s)"
+             f" (relevé en {time.time() - t_start:.1f}s)")
     if total_expected == 0:
         return {**base, "freed": True}
     if not os.path.isdir(root):
@@ -2067,7 +2106,8 @@ def _links_scan(ctx, step):
              + (f" (+{companions} fichier(s) annexe(s))" if companions else "")
              + f", {len(held)} retenu(s) par qBit"
              + (f", {not_found} non localisé(s)" if not_found else "")
-             + (" — index pas encore prêt" if idx is None else ""))
+             + (" — index pas encore prêt" if idx is None else "")
+             + f" (bilan en {time.time() - t_start:.1f}s)")
     return res
 
 
@@ -2107,6 +2147,13 @@ def delete_orphan(torrent, step, qbit_progress, qbit_wait, with_links=True):
         sizes_h = {s for s, _ in QBIT_FILES_CACHE.get(h, []) if s}
         if only_big:
             sizes_h = {s for s in sizes_h if s >= ORPHAN_MIN_FILE_SIZE}
+        # Cas typique : deux Blu-ray complets d'un même éditeur qui partagent
+        # à l'octet près un logo, un avertissement ou une bande-annonce. Ni
+        # doublon ni « torrent plus large » : ignoré.
+        shared = sum(sizes_h & ref)
+        if sizes_h and _shared_is_coincidence(shared, sum(sizes_h), sum(ref)):
+            log.info(f"  Fichier(s) commun(s) par coïncidence ({shared / 1024**2:.0f} Mo), ignoré : {name} ({h[:8]})")
+            continue
         if sizes_h and sizes_h <= ref:
             log.info(f"  Doublon cross-seed : {name} ({h[:8]})")
             to_delete.append(h)
@@ -2142,6 +2189,7 @@ def delete_links(pending):
     fourni par le client), et chacun est revérifié : même inode, fichier
     régulier — sinon ignoré."""
     deleted, errors, count = [], [], {}
+    held_fds = []  # voir _close_fds_async : la libération réelle se fait en tâche de fond
     for l in pending["links"]:
         path = l["path"]
         try:
@@ -2158,15 +2206,26 @@ def delete_links(pending):
         if DRY_RUN:
             log.info(f"[DRY-RUN] Suppression du hardlink {path}")
         else:
+            # Descripteur ouvert AVANT l'unlink : s'il s'agit du dernier lien,
+            # os.remove rend la main tout de suite, et les blocs sont libérés
+            # à la fermeture du descripteur, en tâche de fond.
+            try:
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            except OSError:
+                fd = None
             try:
                 os.remove(path)
             except OSError as e:
+                if fd is not None:
+                    os.close(fd)
                 errors.append(f"{path} : {e}")
                 continue
+            held_fds.append(fd)
             log.info(f"  Hardlink supprimé : {path}")
         deleted.append(path)
         k = f"{l['dev']}:{l['ino']}"
         count[k] = count.get(k, 0) + 1
+    _close_fds_async(held_fds, "hardlinks supprimés")
     freed = sum(pending["sizes"][k] for k, n in count.items() if n >= pending["expected"].get(k, 1 << 60))
     dirs_removed, dirs_kept = _remove_empty_dirs(pending.get("dirs") or [], deleted)
     return {"ok": not errors, "deleted": deleted, "errors": errors, "freed": freed,
@@ -2468,13 +2527,25 @@ def build_inventory(step):
             h = parent[h]
         return h
 
-    owner = {}
+    # Deux torrents ne sont regroupés que si leurs fichiers communs pèsent
+    # au moins la moitié de l'un des deux (voir _shared_is_coincidence) :
+    # deux Blu-ray complets d'un même éditeur partagent souvent un logo ou
+    # une bande-annonce à l'octet près, sans être la même release.
+    totals = {h: sum(ss) for h, ss in sizes_of.items()}
+    owners = {}
     for h, ss in sizes_of.items():
         for s in ss:
-            if s in owner:
-                parent[find(h)] = find(owner[s])
-            else:
-                owner[s] = h
+            owners.setdefault(s, []).append(h)
+    checked = set()
+    for hs in owners.values():
+        for i, a in enumerate(hs):
+            for b in hs[i + 1:]:
+                pair = (a, b) if a < b else (b, a)
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                if not _shared_is_coincidence(sum(sizes_of[a] & sizes_of[b]), totals[a], totals[b]):
+                    parent[find(a)] = find(b)
     groups = {}
     for h in sizes_of:
         groups.setdefault(find(h), []).append(h)

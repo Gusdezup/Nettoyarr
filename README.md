@@ -126,7 +126,10 @@ au choix des suppressions, pensée pour une bibliothèque qui seed beaucoup.
 ### Releases
 
 Nettoyarr regroupe les torrents qBittorrent en **releases** : des torrents
-qui partagent au moins un fichier de 50 Mo ou plus, à l'octet près. Une
+qui partagent au moins un fichier de 50 Mo ou plus, à l'octet près, à
+condition que ces fichiers communs pèsent au moins la moitié de l'un des
+deux torrents (deux Blu-ray complets d'un même éditeur partagent souvent un
+logo ou une bande-annonce identique sans être la même release). Une
 release réunit donc toutes les copies cross-seed d'un même contenu (un
 torrent par tracker), plus un éventuel pack qui la contient. Pour chaque
 release, l'explorateur affiche :
@@ -231,6 +234,11 @@ de saison complets pris en charge).
    l'autorisation de joindre ton Nettoyarr, Violentmonkey ne l'utilise pas.
 4. Sauvegarde, recharge la page qBittorrent WebUI.
 
+Pendant un traitement, le bouton **« Continuer en arrière-plan »** masque la
+popup pour rendre la main à qBittorrent : une pastille en bas à droite
+affiche l'étape en cours (clic pour rouvrir), et la popup réapparaît avec le
+résultat à la fin.
+
 ### Configuration (URL Nettoyarr et identifiants)
 
 L'URL de ton conteneur Nettoyarr et les identifiants d'authentification
@@ -307,7 +315,10 @@ qBittorrent et sur le NAS, avec ses doublons cross-seed. Garde-fous :
 - un autre torrent n'est supprimé comme doublon que si **tous** ses gros
   fichiers (≥ 50 Mo) sont inclus dans le torrent sélectionné : un torrent
   plus large (ex. une intégrale contenant la saison sélectionnée) est
-  conservé et signalé.
+  conservé et signalé ;
+- un torrent dont les fichiers communs ne pèsent qu'une petite part des
+  deux (moins de la moitié de chacun, ex. bande-annonce d'éditeur commune
+  à deux Blu-ray) est ignoré : ni doublon, ni torrent plus large.
 
 ### Autres hardlinks (espace disque)
 
@@ -321,7 +332,9 @@ orphelin), Nettoyarr fait donc le bilan des liens restants :
    descripteur ouvert dessus ;
 2. après suppression (*arr + qBittorrent), il relit le nombre de liens
    réellement restants : s'il est à zéro, l'espace est libéré, rien à
-   chercher ;
+   chercher. La libération effective des blocs (fermeture du descripteur)
+   se fait en tâche de fond : sur btrfs, elle peut prendre plusieurs
+   minutes pour un gros fichier fragmenté, sans faire attendre le résultat ;
 3. sinon il les retrouve via un **index** des fichiers de 50 Mo ou plus de
    `LINKS_SCAN_ROOT`, chaque chemin étant revérifié. L'index est sauvegardé
    dans `data/links-index.json.gz` (disponible dès le démarrage), mis à
@@ -332,7 +345,8 @@ orphelin), Nettoyarr fait donc le bilan des liens restants :
    rafraîchi pour la fois suivante ;
 4. les liens qui ne servent à aucun torrent restant sont listés dans une
    **seconde confirmation**, et ne sont supprimés qu'après ton accord,
-   seulement s'il s'agit toujours du même fichier.
+   seulement s'il s'agit toujours du même fichier (là aussi, l'espace est
+   libéré en tâche de fond, la réponse est immédiate).
    Les fichiers annexes de la release (`.nfo`, images, sous-titres) présents
    dans ces copies sont proposés avec eux — repérés par inode, jamais par
    leur nom — et le dossier de la copie est supprimé s'il ne contient plus
